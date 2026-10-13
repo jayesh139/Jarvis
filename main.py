@@ -82,7 +82,8 @@ from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
 from core.wake_word            import (
-    WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
+    WakeWordDetector, WAKE_PHRASE, is_ready as wake_is_ready,
+    install_and_download as wake_install,
 )
 
 # How long the assistant stays awake with no user speech before it auto-sleeps
@@ -669,7 +670,11 @@ class JarvisLive:
         return {"enabled": self._wake_enabled, "awake": self._awake, "ready": ready}
 
     def _ensure_wake_detector(self) -> bool:
-        """Load the detector once (model loads on first start). Idempotent."""
+        """Load the detector once (model loads on first start). Idempotent.
+
+        Failed loads are sticky until the UI finishes a download — that stops
+        the mic callback from retrying (and flooding the console) every frame.
+        """
         if self._wake_detector is None:
             self._wake_detector = WakeWordDetector(
                 on_detect=self._on_wake_detected,
@@ -681,8 +686,22 @@ class JarvisLive:
         return True
 
     def _on_wake_detected(self) -> None:
-        """Called from the detector thread when 'Hey Jarvis' is heard."""
-        self.wake(reason="wake word")
+        """Called from the detector thread when 'Jarvis' is heard."""
+        # Opens a muted mic (manual F4, Spotify, or video) and/or wakes from sleep.
+        try:
+            self.ui.unmute_via_wake(
+                note=f"Heard '{WAKE_PHRASE}' — microphone open."
+            )
+        except Exception:
+            pass
+        self._last_user_speech = time.monotonic()
+        if not self._awake:
+            self.wake(reason="wake word")
+        elif not self.ui.muted:
+            try:
+                self.ui.set_state("LISTENING")
+            except Exception:
+                pass
 
     def wake(self, reason: str = "wake word") -> None:
         if self._awake:
@@ -699,7 +718,7 @@ class JarvisLive:
         self._awake = False
         self.set_speaking(False)
         self.ui.set_state("SLEEPING")
-        self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey Jarvis' to wake me.")
+        self.ui.write_log(f"SYS: Sleeping — {reason}. Say '{WAKE_PHRASE}' to wake me.")
 
     async def _run_sleep_watch(self) -> None:
         """Auto-sleep after the configured silence window (wake-word mode only)."""
@@ -746,8 +765,13 @@ class JarvisLive:
         """Download openwakeword + the model (runs in a UI worker thread)."""
         # Triggered by the user pressing the button, so its progress is exactly
         # what they are waiting to see.
-        return wake_install(logger=lambda m: print(f"[Wake] {m}"),
-                            notify=lambda m: self.ui.write_log(f"SYS: {m}"))
+        ok, msg = wake_install(logger=lambda m: print(f"[Wake] {m}"),
+                               notify=lambda m: self.ui.write_log(f"SYS: {m}"))
+        if ok and self._wake_detector is not None:
+            self._wake_detector.reset_load_failure()
+        if ok:
+            self._ensure_wake_detector()
+        return ok, msg
 
     def plugin_say(self, instruction: str) -> None:
         """
@@ -843,7 +867,7 @@ class JarvisLive:
         # asleep either (the sleep gate is not just for the mic). Wake first with
         # "Hey Jarvis" or the WAKE NOW button.
         if self._wake_enabled and not self._awake:
-            self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
+            self.ui.write_log(f"SYS: I'm asleep — say '{WAKE_PHRASE}' or tap WAKE NOW first.")
             return
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
@@ -1323,6 +1347,16 @@ class JarvisLive:
                 if det is not None:
                     det.feed(indata)
                 return
+            # Mic muted (F4, Spotify auto-mute, or video sound) — do NOT stream
+            # to Gemini, but keep listening locally for "Jarvis" so the phrase
+            # can open the mic again.
+            try:
+                if self.ui.muted:
+                    if self._ensure_wake_detector():
+                        self._wake_detector.feed(indata)
+                    return
+            except Exception:
+                pass
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
 
@@ -1396,27 +1430,31 @@ class JarvisLive:
                 )
 
             # Which microphone. resolve() returns None for "system default" and
-            # for a saved device that is no longer present — so a headset
-            # unplugged since the last run falls back to the built-in mic
-            # instead of raising on startup and taking the session with it.
+            # for a saved device that is no longer present. After a Live-session
+            # abort, Bluetooth defaults often refuse to reopen (PortAudio
+            # -9986) — so we walk built-in devices next instead of crashing
+            # the TaskGroup in a reconnect loop.
             _mic_name = get_input_device()
             _mic_dev  = audio_devices.resolve(_mic_name, "input")
             if _mic_dev is not None:
                 print(f"[JARVIS] 🎤 Input device: {_mic_name}")
-            try:
-                _mic_stream = _open_mic(_mic_dev)
-            except Exception as _e:
-                # A device the picker listed but the driver will not open right
-                # now — exclusive mode, a webcam already in use, a virtual mic
-                # whose source went away. Chosen hardware failing must never
-                # mean the assistant cannot hear at all.
-                if _mic_dev is None:
-                    raise
-                print(f"[JARVIS] ⚠️  Mic '{_mic_name}' failed: {_e} — using default")
-                self.ui.write_log(
-                    f"SYS: Microphone '{_mic_name}' unavailable — using system default."
-                )
-                _mic_stream = _open_mic(None)
+
+            _mic_stream = None
+            _last_err = None
+            for idx, label in audio_devices.candidate_devices("input", _mic_dev):
+                try:
+                    _mic_stream = _open_mic(idx)
+                    if idx != _mic_dev:
+                        print(f"[JARVIS] 🎤 Mic open: {label}")
+                        self.ui.write_log(
+                            f"SYS: Microphone fell back to '{label}'."
+                        )
+                    break
+                except Exception as _e:
+                    _last_err = _e
+                    print(f"[JARVIS] ⚠️  Mic '{label}' failed: {_e}")
+            if _mic_stream is None:
+                raise _last_err or RuntimeError("no microphone could be opened")
 
             with _mic_stream:
                 print("[JARVIS] 🎤 Mic stream open")
@@ -1617,17 +1655,22 @@ class JarvisLive:
             st.start()
             return st
 
-        try:
-            stream = _open_spk(_spk_dev)
-        except Exception as _e:
-            # A chosen output that the host API accepts by name but refuses to
-            # open (exclusive mode, wrong sample rate, device asleep) must not
-            # cost the user their voice. Fall back to the default and say so.
-            if _spk_dev is None:
-                raise
-            print(f"[JARVIS] ⚠️  Output device '{_spk_name}' failed: {_e} — using default")
-            self.ui.write_log(f"SYS: Speaker '{_spk_name}' unavailable — using system default.")
-            stream = _open_spk(None)
+        stream = None
+        _last_err = None
+        for idx, label in audio_devices.candidate_devices("output", _spk_dev):
+            try:
+                stream = _open_spk(idx)
+                if idx != _spk_dev:
+                    print(f"[JARVIS] 🔊 Speakers open: {label}")
+                    self.ui.write_log(
+                        f"SYS: Speakers fell back to '{label}'."
+                    )
+                break
+            except Exception as _e:
+                _last_err = _e
+                print(f"[JARVIS] ⚠️  Speakers '{label}' failed: {_e}")
+        if stream is None:
+            raise _last_err or RuntimeError("no speakers could be opened")
 
         # Ask the device how far behind the speakers actually are, rather than
         # assuming. This is what the echo tail is sized from, so a machine with a
@@ -1767,9 +1810,15 @@ class JarvisLive:
         # The briefing fires before the user has said anything, so the
         # remembered language is the only signal there is. It is a starting
         # point, not a setting: the moment they reply, their language wins.
-        lang_clause = (f" Speak this greeting in {lang}, then follow the "
-                       f"user's own language from their first reply onward."
-                       if lang else "")
+        # Spoken replies are restricted to English / Hindi only (see prompt.txt).
+        _lang_ok = lang.lower() in ("english", "hindi") if lang else False
+        lang_clause = (
+            f" Speak this greeting in {lang}. After that, reply only in English "
+            f"or Hindi — match whichever of those two the user uses."
+            if _lang_ok else
+            " Speak this greeting in English. From then on reply only in English "
+            "or Hindi — match whichever of those two the user uses."
+        )
         name_clause = f" Address the user as {name}." if name else ""
 
         # Inject last session context if available — pop removes it so it's never repeated
@@ -1803,9 +1852,14 @@ class JarvisLive:
         # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
         async def _deliver_news():
             try:
-                lang_str = (f" Speak in {lang} unless the user has since "
-                            f"spoken another language, in which case use theirs."
-                            if lang else "")
+                lang_str = (
+                    f" Speak in {lang} unless the user has since spoken the other "
+                    f"allowed language (English or Hindi), in which case use that. "
+                    f"Never use any language other than English or Hindi."
+                    if _lang_ok else
+                    " Speak in English or Hindi only — match the user if they used "
+                    "one of those; otherwise English. Never any other language."
+                )
 
                 # Wait for news fetch (already running) and Phase 1 turn-complete
                 # in parallel — whichever takes longer determines the wait time
@@ -2138,13 +2192,20 @@ class JarvisLive:
                         # is the whole point, and it is invisible otherwise.
                         self.ui.write_log("SYS: Reconnected — conversation restored.")
 
+                    # Let CoreAudio release the previous session's streams, then
+                    # reset PortAudio once — before mic/speaker tasks race to open.
+                    # Without this, a Bluetooth default often fails with -9986
+                    # after Gemini aborts the websocket, and the reconnect loops.
+                    await asyncio.sleep(0.35)
+                    audio_devices.refresh_host()
+
                     # Wake word: if enabled, come up ASLEEP (mic gated, silent)
                     # until the user says "Hey Jarvis" or taps wake in the UI.
                     if self._wake_enabled:
                         self._ensure_wake_detector()
                         self._awake = False
                         self.ui.set_state("SLEEPING")
-                        self.ui.write_log("SYS: JARVIS online — sleeping. Say 'Hey Jarvis' to wake me.")
+                        self.ui.write_log(f"SYS: JARVIS online — sleeping. Say '{WAKE_PHRASE}' to wake me.")
                     else:
                         self._awake = True
                         self.ui.set_state("LISTENING")

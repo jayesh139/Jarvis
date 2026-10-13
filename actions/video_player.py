@@ -91,10 +91,17 @@ def _resolve_youtube(url_or_query: str) -> tuple[str, str, str, str]:
                             "Run: pip install yt-dlp")
 
     query = url_or_query if _YT.search(url_or_query) else f"ytsearch1:{url_or_query}"
-    # No "format" here on purpose: ask for everything and choose below, so a
-    # video that lacks whatever was requested cannot fail outright.
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
-            "noplaylist": True}
+    # Android (then web) is intentional: the default client often returns only
+    # split DASH streams. Qt plays those, but a progressive combined MP4
+    # (itag 18) is far more reliable in the HUD — one player, no A/V drift,
+    # fewer mid-stream demux failures. Split streams remain the fallback.
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(query, download=False)
@@ -133,17 +140,31 @@ def _resolve_youtube(url_or_query: str) -> tuple[str, str, str, str]:
                    key=lambda f: (f.get("language_preference") or 0,
                                   f.get("tbr") or 0))
 
-    # Combined first — if a video still has one, one player is simpler and
-    # cannot drift. Then picture and sound separately.
-    combined = best([f for f in formats if has(f, "vcodec") and has(f, "acodec")])
+    # Combined progressive first — one player, no sync, works best with Qt.
+    combined = best([f for f in formats
+                     if has(f, "vcodec") and has(f, "acodec")
+                     and f.get("ext") == "mp4"
+                     and not f.get("fragments")])
+    if not combined:
+        combined = best([f for f in formats
+                         if has(f, "vcodec") and has(f, "acodec")])
     if combined:
+        print(f"[Video] combined stream: {combined.get('format_id')} "
+              f"{combined.get('ext')} h={combined.get('height')}")
         return combined["url"], "", info.get("title") or "", ""
 
     # 720p is the ceiling on purpose: the HUD panel is nowhere near 4K, and a
-    # smaller stream starts sooner and drifts less.
+    # smaller stream starts sooner and drifts less. Prefer H.264/mp4 — VP9/AV1
+    # DASH is more brittle under Qt's FFmpeg demuxer.
     video = best([f for f in formats
                   if has(f, "vcodec") and not has(f, "acodec")
-                  and f.get("ext") == "mp4" and (f.get("height") or 0) <= 720])
+                  and f.get("ext") == "mp4"
+                  and str(f.get("vcodec") or "").startswith(("avc", "avc1"))
+                  and (f.get("height") or 0) <= 720])
+    if not video:
+        video = best([f for f in formats
+                      if has(f, "vcodec") and not has(f, "acodec")
+                      and f.get("ext") == "mp4" and (f.get("height") or 0) <= 720])
     if not video:
         video = best([f for f in formats
                       if has(f, "vcodec") and not has(f, "acodec")])
@@ -159,6 +180,8 @@ def _resolve_youtube(url_or_query: str) -> tuple[str, str, str, str]:
     if audio and audio.get("language"):
         print(f"[Video] audio track: {audio.get('language')} "
               f"({audio.get('format_note') or audio.get('format_id')})")
+    print(f"[Video] split streams: video={video.get('format_id')} "
+          f"audio={(audio or {}).get('format_id')}")
     return video["url"], (audio or {}).get("url", ""), info.get("title") or "", ""
 
 
@@ -291,7 +314,8 @@ TOOL = {
         "putting it on the display, and do not wait or call it again. "
         "Do NOT use 'youtube_video' for this: that optional plugin opens videos "
         "in the web browser and summarises transcripts, it never plays anything "
-        "on the assistant's display."
+        "on the assistant's display. "
+        "Do NOT use this for music / Spotify — use 'spotify_player' instead."
     ),
     "parameters": {
         "type": "OBJECT",

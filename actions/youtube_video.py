@@ -444,7 +444,13 @@ def youtube_video(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "youtube_video",
-    "description": "Controls YouTube. Use for: playing videos, summarizing a video's content, getting video info, or showing trending videos.",
+    "description": (
+        "YouTube helpers that do NOT play on the assistant's own display. Use "
+        "for: summarizing a video's transcript, getting video info, or showing "
+        "trending videos. For WATCHING a video on screen (where the avatar is), "
+        "ALWAYS use 'video_player' instead — this tool only opens the system "
+        "browser and will not show anything in the HUD."
+    ),
     "parameters": {
         "type": "OBJECT",
         "properties": {

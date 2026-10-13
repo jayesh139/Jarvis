@@ -1,5 +1,5 @@
 """
-Local wake-word detection for JARVIS ("Hey Jarvis").
+Local wake-word detection for JARVIS ("Jarvis").
 
 Design goals:
   • ZERO cost when the feature is off — openwakeword is imported ONLY inside
@@ -13,7 +13,9 @@ Design goals:
     network call except the one-time model download the user triggers from the UI.
 
 openwakeword ships small ONNX models (a few MB each) and runs comfortably on a
-CPU. The pretrained wake phrase used here is "Hey Jarvis".
+CPU. The pretrained model id is still ``hey_jarvis`` (no shorter public model
+exists); the score threshold is tuned so a clear "Jarvis" is enough — you do
+not need to say "Hey" first.
 """
 from __future__ import annotations
 
@@ -24,10 +26,13 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-# Pretrained openwakeword model that listens for "Hey Jarvis".
+# openwakeword's pretrained Jarvis model (trained on "Hey Jarvis", also fires
+# on a clear "Jarvis" at the lowered threshold below).
 WAKE_MODEL = "hey_jarvis"
-# Score in [0,1]; above this counts as a detection. Tunable per environment.
-DEFAULT_THRESHOLD = 0.5
+WAKE_PHRASE = "Jarvis"
+# Score in [0,1]; above this counts as a detection. 0.35 catches "Jarvis"
+# alone more reliably than the old 0.5 (which wanted the full "Hey Jarvis").
+DEFAULT_THRESHOLD = 0.35
 # Mic frames arrive at 16 kHz int16; this is just the detector's input rate.
 SAMPLE_RATE = 16000
 
@@ -41,6 +46,15 @@ def is_installed() -> bool:
         return False
 
 
+def _models_dir() -> Path | None:
+    try:
+        import openwakeword
+        d = Path(openwakeword.__file__).resolve().parent / "resources" / "models"
+        return d if d.is_dir() else None
+    except Exception:
+        return None
+
+
 def is_ready() -> bool:
     """True if openwakeword is installed AND its model files are present on disk.
 
@@ -48,23 +62,47 @@ def is_ready() -> bool:
     construct a Model to probe readiness — doing that is slow and, worse, can clash
     with the detector's own Model when it's already running, which intermittently
     returned False and made the UI flicker to 'not downloaded'. Never raises.
+
+    We require the ONNX set: the detector loads with inference_framework=\"onnx\",
+    and a lone melspectrogram.tflite is not enough (that mismatch used to spam
+    NO_SUCHFILE on every mic frame).
     """
     if not is_installed():
         return False
     try:
-        import openwakeword
-        models_dir = Path(openwakeword.__file__).resolve().parent / "resources" / "models"
-        if not models_dir.is_dir():
+        models_dir = _models_dir()
+        if models_dir is None:
             return False
-        has_wake = (any(models_dir.glob(f"{WAKE_MODEL}*.onnx"))
-                    or any(models_dir.glob(f"{WAKE_MODEL}*.tflite")))
-        has_mel = (any(models_dir.glob("melspectrogram*.onnx"))
-                   or any(models_dir.glob("melspectrogram*.tflite")))
-        has_emb = (any(models_dir.glob("embedding_model*.onnx"))
-                   or any(models_dir.glob("embedding_model*.tflite")))
+        has_wake = any(models_dir.glob(f"{WAKE_MODEL}*.onnx"))
+        has_mel = (models_dir / "melspectrogram.onnx").exists()
+        has_emb = (models_dir / "embedding_model.onnx").exists()
         return bool(has_wake and has_mel and has_emb)
     except Exception:
         return False
+
+
+def _ensure_melspectrogram_onnx(logger: Callable[[str], None] = print) -> bool:
+    """openwakeword's download_models() sometimes leaves mel as tflite-only."""
+    models_dir = _models_dir()
+    if models_dir is None:
+        return False
+    target = models_dir / "melspectrogram.onnx"
+    if target.exists() and target.stat().st_size > 100_000:
+        return True
+    urls = (
+        "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/melspectrogram.onnx",
+        "https://github.com/dscripka/openWakeWord/releases/download/v0.5.0/melspectrogram.onnx",
+    )
+    import urllib.request
+    for url in urls:
+        try:
+            logger(f"Wake word: fetching melspectrogram.onnx…")
+            urllib.request.urlretrieve(url, target)
+            if target.exists() and target.stat().st_size > 100_000:
+                return True
+        except Exception as e:
+            logger(f"Wake word: mel download failed ({e})")
+    return target.exists()
 
 
 def install_and_download(logger: Callable[[str], None] = print,
@@ -98,6 +136,11 @@ def install_and_download(logger: Callable[[str], None] = print,
         except Exception as e:
             return False, f"model download failed: {e}"
 
+        # download_models() has been observed to leave only melspectrogram.tflite
+        # while the ONNX loader still needs melspectrogram.onnx — fetch it.
+        if not _ensure_melspectrogram_onnx(logger):
+            return False, "installed, but melspectrogram.onnx could not be downloaded."
+
         if not is_ready():
             return False, "installed, but the wake model could not be loaded."
         logger("Wake word: ready.")
@@ -128,25 +171,59 @@ class WakeWordDetector:
         self._running = False
         self._model = None
         self._ready = False
+        # After one failed load, do not retry on every mic frame (that spammed
+        # the console thousands of times when the .onnx file was missing).
+        # Call reset_load_failure() after a successful model download.
+        self._load_failed = False
+        self._load_error = ""
+
+    def reset_load_failure(self) -> None:
+        """Allow start() to try again (e.g. after install_and_download)."""
+        self._load_failed = False
+        self._load_error = ""
 
     def start(self) -> bool:
         """Load the model and spawn the inference thread. Returns True on success.
         Safe to call again — a no-op if already running. Never raises."""
         if self._running:
             return True
+        if self._load_failed:
+            return False
+        # Don't even ask ONNXRuntime if the files are not on disk yet.
+        if not is_ready():
+            self._load_failed = True
+            self._load_error = "model files not downloaded"
+            self._logger("Wake word: model not downloaded yet — use ⚙ → WAKE WORD → DOWNLOAD.")
+            self._notify("Wake word model missing — download it from ⚙ → WAKE WORD.")
+            return False
         try:
             from openwakeword.model import Model
-            self._model = Model(wakeword_models=[WAKE_MODEL], inference_framework="onnx")
+            # Prefer ONNX; fall back to tflite if the runtime is available.
+            last_err: Exception | None = None
+            self._model = None
+            for fw in ("onnx", "tflite"):
+                try:
+                    self._model = Model(wakeword_models=[WAKE_MODEL],
+                                        inference_framework=fw)
+                    break
+                except Exception as e:
+                    last_err = e
+                    self._model = None
+            if self._model is None:
+                raise last_err or RuntimeError("no inference framework worked")
         except Exception as e:
+            self._load_failed = True
+            self._load_error = str(e)
             self._logger(f"Wake word: could not load model — {e}")
-            self._notify("Wake word unavailable — use the WAKE NOW button.")
+            self._notify("Wake word unavailable — download the model from ⚙ → WAKE WORD, or use F4.")
             self._model = None
             return False
         self._running = True
         self._ready = True
+        self._load_failed = False
         self._thread = threading.Thread(target=self._loop, daemon=True, name="WakeWordThread")
         self._thread.start()
-        self._logger("Wake word: listening for 'Hey Jarvis'.")
+        self._logger(f"Wake word: listening for '{WAKE_PHRASE}'.")
         return True
 
     def stop(self) -> None:

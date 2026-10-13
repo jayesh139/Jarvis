@@ -105,7 +105,7 @@ def save_voice(voice_name: str) -> None:
 
 
 def get_wake_word_enabled() -> bool:
-    """Whether local wake-word gating is on (assistant sleeps until 'Hey Jarvis')."""
+    """Whether local wake-word gating is on (assistant sleeps until 'Jarvis')."""
     return load_api_keys().get("wake_word_enabled", False)
 
 

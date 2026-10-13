@@ -2951,6 +2951,8 @@ class MainWindow(QMainWindow):
     _wake_btns_sig   = pyqtSignal()          # wake state resolved off-thread
     _video_close_sig = pyqtSignal()
     _video_mute_sig  = pyqtSignal(bool)
+    _spotify_playing_sig = pyqtSignal(bool)  # Spotify is_playing → auto-mute mic
+    _unmute_wake_sig = pyqtSignal(str)       # say "Jarvis" → unmute (any mute reason)
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
     _confirm_hide_sig = pyqtSignal()
@@ -3069,6 +3071,12 @@ class MainWindow(QMainWindow):
         # called from plugin threads, and reading a widget's state from one is
         # not something to rely on; an attribute is.
         self._video_on = False
+        # Spotify music (phone / desktop / web) — same problem as HUD video
+        # sound: the mic hears the track and invents commands. Auto-mute while
+        # playing; unmute only via wake phrase, pause, or F4.
+        self._spotify_playing = False
+        self._spotify_auto_muted = False
+        self._spotify_mute_suppressed = False
         self._video_cont = QWidget()
         self._video_cont.setStyleSheet(f"background: {C.BG};")
         _vid_v = QVBoxLayout(self._video_cont)
@@ -3236,6 +3244,8 @@ class MainWindow(QMainWindow):
         self._video_open_sig.connect(self._on_video_open)
         self._video_close_sig.connect(self._on_video_close)
         self._video_mute_sig.connect(self._on_video_mute)
+        self._spotify_playing_sig.connect(self._on_spotify_playing)
+        self._unmute_wake_sig.connect(self._on_unmute_via_wake)
         self._clipboard_sig.connect(self._show_clipboard_panel)
         self._wake_dl_sig.connect(self._on_wake_install_done)
         self._quiz_sig.connect(self._show_quiz)
@@ -3343,6 +3353,26 @@ class MainWindow(QMainWindow):
     # Everything below runs on the Qt thread. Plugins and the assistant reach it
     # through the signals above, the same way every other panel is driven, so a
     # background thread never touches a widget.
+    def _media_url(self, source: str) -> QUrl:
+        """Build a QUrl for a local path or remote stream.
+
+        Remote URLs must not go through Path.exists() — pathlib collapses
+        ``https://`` to ``https:/``, and macOS then raises ENAMETOOLONG on
+        long googlevideo query strings (that crash is what used to abort the
+        whole app the moment a YouTube stream was opened).
+        """
+        src = (source or "").strip()
+        if not src:
+            return QUrl()
+        if src.startswith(("http://", "https://", "file:")):
+            return QUrl(src)
+        try:
+            if Path(src).exists():
+                return QUrl.fromLocalFile(src)
+        except OSError:
+            pass
+        return QUrl(src)
+
     def _on_video_open(self, source: str, title: str, muted: bool,
                        audio_source: str = "") -> None:
         if not HAVE_VIDEO or not self._video_player:
@@ -3352,15 +3382,28 @@ class MainWindow(QMainWindow):
         # A video and the live camera cannot share the centre of the HUD.
         self._cam_stop.set()
 
+        # Stop whatever was already playing before swapping sources — leaving
+        # a previous DASH demuxer running while setSource() runs has been seen
+        # to leave the new stream stuck in BufferingMedia with a black frame.
+        if self._video_sync:
+            self._video_sync.stop()
+        for p in (self._video_player, self._video_sound):
+            if p:
+                p.stop()
+
         self._video_title.setText(f"▶  {(title or 'VIDEO')[:44].upper()}")
         self._video_split = bool(audio_source)
         self._set_video_muted(bool(muted))
 
-        url = (QUrl.fromLocalFile(source) if Path(source).exists()
-               else QUrl(source))
+        url = self._media_url(source)
+        if not url.isValid():
+            self.write_log("SYS: The video source was not a valid URL or path.")
+            return
         self._video_player.setSource(url)
-        if self._video_split:
-            self._video_sound.setSource(QUrl(audio_source))
+        if self._video_split and self._video_sound:
+            self._video_sound.setSource(self._media_url(audio_source))
+        elif self._video_sound:
+            self._video_sound.setSource(QUrl())
         self._hud_cam_stack.setCurrentIndex(2)
         self._video_on = True
         # Re-run now that the video counts as playing: _set_video_muted ran
@@ -3370,6 +3413,10 @@ class MainWindow(QMainWindow):
         if self._video_split:
             self._video_sound.play()
             self._video_sync.start()
+        # nativeSizeChanged can fire before the view has a real size; retry
+        # once the stack page is visible so the picture is not 0×0.
+        QTimer.singleShot(50, self._fit_video)
+        QTimer.singleShot(300, self._fit_video)
 
     def _fit_video(self, *_a) -> None:
         """Size the picture to the panel, keeping its shape."""
@@ -3377,9 +3424,11 @@ class MainWindow(QMainWindow):
             return
         try:
             native = self._video_item.nativeSize()
-            if native.isEmpty():
+            if native.isEmpty() or native.width() <= 0 or native.height() <= 0:
                 return
             view = self._video_widget.viewport().size()
+            if view.width() <= 0 or view.height() <= 0:
+                return
             scale = min(view.width() / native.width(),
                         view.height() / native.height())
             w, h = native.width() * scale, native.height() * scale
@@ -3441,6 +3490,58 @@ class MainWindow(QMainWindow):
             self._video_auto_muted = False
             self._set_muted(False, "The video is quiet again.")
 
+    def _on_spotify_playing(self, playing: bool) -> None:
+        self._spotify_playing = bool(playing)
+        if not self._spotify_playing:
+            self._spotify_mute_suppressed = False
+        self._sync_mic_for_spotify()
+
+    def _sync_mic_for_spotify(self) -> None:
+        """Mute while Spotify is playing so lyrics do not become commands.
+
+        Unmute paths (only):
+          • say the wake phrase ("Jarvis") — see unmute_via_wake()
+          • pause / stop Spotify (playing → False)
+          • press F4 (user takes the mic back; remute suppressed until pause)
+        """
+        if (self._spotify_playing and not self._spotify_mute_suppressed
+                and not self._muted):
+            self._spotify_auto_muted = True
+            self._set_muted(
+                True,
+                "Spotify is playing — say 'Jarvis', pause the music, or press F4 "
+                "to talk. Typing still works.",
+            )
+        elif not self._spotify_playing and self._spotify_auto_muted:
+            self._spotify_auto_muted = False
+            self._set_muted(False, "Music paused — microphone open again.")
+
+    def unmute_via_wake(self, note: str = "") -> bool:
+        """Open the mic after hearing 'Jarvis' — works for any mute reason.
+
+        Safe from the wake-detector thread (Qt signal). Returns whether the mic
+        was muted and an unmute was requested.
+        """
+        if not self._muted:
+            return False
+        self._unmute_wake_sig.emit(
+            note or "Heard wake phrase — microphone open."
+        )
+        return True
+
+    def _on_unmute_via_wake(self, note: str) -> None:
+        self._video_auto_muted = False
+        self._spotify_auto_muted = False
+        # If music is still going, don't immediately remute after this unmute.
+        if self._spotify_playing:
+            self._spotify_mute_suppressed = True
+        if self._muted:
+            self._set_muted(False, note)
+
+    def set_spotify_playing(self, playing: bool) -> None:
+        """Thread-safe: Spotify is_playing changed (from the Spotify action)."""
+        self._spotify_playing_sig.emit(bool(playing))
+
     def _sync_video_sound(self) -> None:
         """Keep the separate soundtrack in step with the picture.
 
@@ -3477,6 +3578,23 @@ class MainWindow(QMainWindow):
             err = self._video_player.errorString()
         except Exception:
             pass
+        # DASH googlevideo streams sometimes emit a demuxer error mid-play
+        # ("partial file" / Invalid data) while frames are still advancing.
+        # Closing on every signal made the HUD flash black and give up; only
+        # abandon the surface when nothing useful is actually playing.
+        still_going = False
+        try:
+            still_going = (
+                self._video_on
+                and self._video_player.playbackState()
+                == QMediaPlayer.PlaybackState.PlayingState
+                and self._video_player.position() > 0
+            )
+        except Exception:
+            pass
+        if still_going:
+            self.write_log(f"SYS: Video glitch (continuing){(' — ' + err) if err else ''}.")
+            return
         self.write_log(f"SYS: The video could not be played{(' — ' + err) if err else ''}.")
         self._on_video_close()
 
@@ -5501,9 +5619,13 @@ class MainWindow(QMainWindow):
             self.on_interrupt()
 
     def _toggle_mute(self):
-        # A deliberate press settles the question: whatever the video did, or is
-        # about to do, the user has now said what they want.
+        # A deliberate press settles the question: whatever the video / Spotify
+        # auto-mute did, the user has now said what they want.
         self._video_auto_muted = False
+        self._spotify_auto_muted = False
+        if self._spotify_playing and self._muted:
+            # Opening the mic while music still plays — don't immediately remute.
+            self._spotify_mute_suppressed = True
         self._set_muted(not self._muted)
 
     def _set_muted(self, muted: bool, note: str = ""):
@@ -5515,7 +5637,8 @@ class MainWindow(QMainWindow):
         self._style_mute_btn()
         if muted:
             self._apply_state("MUTED")
-            self._log.append_log("SYS: Microphone muted." + (f" {note}" if note else ""))
+            tip = note or "Say 'Jarvis' or press F4 to unmute."
+            self._log.append_log(f"SYS: Microphone muted. {tip}")
         else:
             self._apply_state("LISTENING")
             self._log.append_log("SYS: Microphone active." + (f" {note}" if note else ""))
@@ -5828,6 +5951,14 @@ class JarvisUI:
 
     def video_is_playing(self) -> bool:
         return bool(self._win.video_is_playing())
+
+    def set_spotify_playing(self, playing: bool) -> None:
+        """Thread-safe: Spotify playback started/stopped → auto-mute mic."""
+        self._win.set_spotify_playing(bool(playing))
+
+    def unmute_via_wake(self, note: str = "") -> bool:
+        """Thread-safe: say Jarvis → unmute (manual, Spotify, or video mute)."""
+        return bool(self._win.unmute_via_wake(note))
 
     def start_camera_stream(self) -> None:
         """Thread-safe: start live camera feed in the full HUD area."""

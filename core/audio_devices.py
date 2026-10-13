@@ -419,3 +419,95 @@ def resolve(name: str, kind: str):
     except Exception as e:
         print(f"[Audio] resolve({kind}) failed: {e} — using system default")
         return None
+
+
+# Virtual / capture-only / routing gadgets that must never be a silent fallback.
+_FALLBACK_SKIP = (
+    "premiere", "zoom", "airbeam", "blackhole", "virtual", "soundflower",
+    "aggregate", "multi-output", "cable",
+)
+# Prefer these when the OS default (often a sleepy Bluetooth headset) fails.
+_FALLBACK_PREFER = (
+    "macbook", "built-in", "built in", "internal",
+)
+# Try these later — they commonly return PortAudio -9986 right after a reconnect.
+_FALLBACK_DEFER = (
+    "airpods", "neckband", "bluetooth", "cmf", "buds", "wh-", "headset",
+)
+
+
+def refresh_host() -> None:
+    """Re-init PortAudio after a hard audio failure / session reconnect.
+
+    On macOS, aborting a Live session mid-stream can leave CoreAudio holding a
+    Bluetooth endpoint; the next open then fails with PaErrorCode -9986 until
+    the host API is reset. Safe to call when no streams are open.
+    """
+    try:
+        import sounddevice as sd
+        sd._terminate()
+        sd._initialize()
+        # Device indices may have shifted — drop the name cache.
+        global _cache
+        with _cache_lock:
+            _cache = None
+    except Exception as e:
+        print(f"[Audio] host refresh failed: {e}")
+
+
+def _fallback_rank(name: str) -> tuple:
+    low = (name or "").lower()
+    if any(tok in low for tok in _FALLBACK_SKIP):
+        return (3, low)
+    if any(tok in low for tok in _FALLBACK_PREFER):
+        return (0, low)
+    if any(tok in low for tok in _FALLBACK_DEFER):
+        return (2, low)
+    return (1, low)
+
+
+def candidate_devices(kind: str, preferred=None) -> list[tuple]:
+    """Ordered ``(index_or_None, label)`` to try when opening a stream.
+
+    ``preferred`` is the resolve() result (an index, or None for OS default).
+    Built-in Mac devices are tried before Bluetooth when the preferred open
+    fails — that is what stops the reconnect loop after a neckband drops.
+    """
+    import sounddevice as sd
+
+    chan_key = "max_input_channels" if kind == "input" else "max_output_channels"
+    devices = list(sd.query_devices())
+    ordered: list[tuple] = []
+    seen: set = set()
+
+    def _add(idx, label: str):
+        key = idx if idx is not None else ("default", label)
+        if key in seen:
+            return
+        seen.add(key)
+        ordered.append((idx, label))
+
+    if preferred is not None:
+        try:
+            name = (devices[preferred].get("name") or f"device {preferred}").strip()
+        except Exception:
+            name = f"device {preferred}"
+        _add(preferred, name)
+    _add(None, "System default")
+
+    others = []
+    for idx, dev in enumerate(devices):
+        if preferred is not None and idx == preferred:
+            continue
+        if dev.get(chan_key, 0) <= 0:
+            continue
+        name = (dev.get("name") or "").strip()
+        if not name or _is_pseudo(name):
+            continue
+        if any(tok in name.lower() for tok in _FALLBACK_SKIP):
+            continue
+        others.append((idx, name))
+    others.sort(key=lambda t: _fallback_rank(t[1]))
+    for idx, name in others:
+        _add(idx, name)
+    return ordered
