@@ -234,7 +234,13 @@ def _ensure_network_access(port: int) -> None:
     # ── macOS ─────────────────────────────────────────────────────────────────
     if sys.platform == "darwin":
         fw_ctl = "/usr/libexec/ApplicationFirewall/socketfilterfw"
+        skip_file = BASE_DIR / "config" / ".firewall_prompt_skip"
         try:
+            # Only one admin dialog per process (PORT and PORT+1 both call this).
+            if getattr(_ensure_network_access, "_mac_done", False):
+                return
+            _ensure_network_access._mac_done = True  # type: ignore[attr-defined]
+
             r = subprocess.run(
                 [fw_ctl, "--getglobalstate"], capture_output=True, text=True, timeout=5,
             )
@@ -248,13 +254,38 @@ def _ensure_network_access(port: int) -> None:
             if py in listed.stdout:
                 return  # already allowed
 
+            # If the user cancelled recently, don't nag every launch.
+            try:
+                if skip_file.exists() and (time.time() - skip_file.stat().st_mtime) < 7 * 86400:
+                    print("[Dashboard] Skipping firewall password prompt "
+                          "(cancelled earlier). Phone LAN access may be blocked.")
+                    return
+            except Exception:
+                pass
+
             print("[Dashboard] One-time network setup — enter your password in the macOS dialog.")
-            subprocess.run(
+            print("[Dashboard] (Cancel is fine if you don't need phone Remote Dashboard.)")
+            proc = subprocess.run(
                 ["osascript", "-e",
-                 f'do shell script "{fw_ctl} --add {py} && {fw_ctl} --unblockapp {py}"'
+                 f'do shell script "{fw_ctl} --add \\"{py}\\" && '
+                 f'{fw_ctl} --unblockapp \\"{py}\\""'
                  f' with administrator privileges'],
-                timeout=60,
+                capture_output=True, text=True, timeout=120,
             )
+            if proc.returncode == 0:
+                print(f"[Dashboard] Firewall: allowed {py}")
+                try:
+                    skip_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            else:
+                # -128 = user cancelled; remember so we don't loop prompts.
+                try:
+                    skip_file.parent.mkdir(parents=True, exist_ok=True)
+                    skip_file.write_text("cancelled\n", encoding="utf-8")
+                except Exception:
+                    pass
+                print("[Dashboard] Firewall prompt cancelled — won't ask again for a week.")
         except Exception:
             pass  # macOS firewall is off by default — silent failure is fine
         return

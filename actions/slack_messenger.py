@@ -313,6 +313,42 @@ def _looks_like_id(value: str) -> bool:
     return bool(re.fullmatch(r"[CDGUVW][A-Z0-9]{8,}", value.strip().upper()))
 
 
+def _match_user(query: str) -> tuple[str | None, str | None]:
+    """Best-effort match against the in-memory user cache. Returns (uid, label)."""
+    q = query.lower().lstrip("@").strip()
+    if not q:
+        return None, None
+    # Exact keys first
+    for key in (q, f"@{q}"):
+        if key in _user_cache:
+            return _user_cache[key], f"@{q}"
+    # Exact display/handle equality
+    for name, uid in _user_cache.items():
+        n = name.lstrip("@")
+        if n == q:
+            return uid, f"@{n}"
+    # First-name / substring: "avani" matches "avani sharma"
+    hits: list[tuple[str, str]] = []
+    for name, uid in _user_cache.items():
+        n = name.lstrip("@")
+        parts = n.replace(".", " ").replace("_", " ").split()
+        if q in n or any(p == q or p.startswith(q) for p in parts):
+            hits.append((uid, n))
+    # Dedupe by uid, prefer shorter display names
+    uniq: dict[str, str] = {}
+    for uid, n in hits:
+        if uid not in uniq or len(n) < len(uniq[uid]):
+            uniq[uid] = n
+    if len(uniq) == 1:
+        uid, n = next(iter(uniq.items()))
+        return uid, f"@{n}"
+    if len(uniq) > 1:
+        # Ambiguous — still return None with a hint via label channel
+        names = ", ".join(sorted(uniq.values())[:5])
+        return None, f"ambiguous:{names}"
+    return None, None
+
+
 def _resolve_target(token: str, raw: str) -> tuple[str | None, str]:
     """Return (channel_id_or_user_id, label) or (None, error)."""
     target = (raw or "").strip()
@@ -322,7 +358,12 @@ def _resolve_target(token: str, raw: str) -> tuple[str | None, str]:
     if _looks_like_id(target):
         return target.upper(), target
 
-    _refresh_caches(token)
+    # If caches are empty (common right after a rate-limit storm), force a refresh.
+    if not _user_cache or not _channel_cache:
+        _refresh_caches(token, force=True)
+    else:
+        _refresh_caches(token)
+
     key = target.lower().lstrip()
     # Channel forms: #eng, eng, channel eng
     ch_key = key
@@ -332,7 +373,6 @@ def _resolve_target(token: str, raw: str) -> tuple[str | None, str]:
         name = ch_key.lstrip("#")
         return _channel_cache[ch_key], f"#{name}"
 
-    # Fuzzy channel contains
     bare = ch_key.lstrip("#")
     for name, cid in _channel_cache.items():
         if name.lstrip("#") == bare:
@@ -348,17 +388,38 @@ def _resolve_target(token: str, raw: str) -> tuple[str | None, str]:
         u_key = u_key[3:].strip()
     if u_key.startswith("to "):
         u_key = u_key[3:].strip()
-    if u_key in _user_cache:
-        return _user_cache[u_key], u_key if u_key.startswith("@") else f"@{u_key}"
 
-    for name, uid in _user_cache.items():
-        n = name.lstrip("@")
-        if bare == n or bare in n or n in bare:
-            return uid, f"@{n}"
+    uid, label = _match_user(u_key)
+    if uid:
+        return uid, label or f"@{u_key.lstrip('@')}"
+    if label and label.startswith("ambiguous:"):
+        names = label.split(":", 1)[1]
+        return None, (
+            f"Several Slack people match '{target}': {names}. "
+            f"Say the fuller name so I can tell them apart."
+        )
 
+    # Last chance: force one more directory pull if we still have no users.
+    if not _user_cache:
+        _refresh_caches(token, force=True)
+        uid, label = _match_user(u_key)
+        if uid:
+            return uid, label or f"@{u_key.lstrip('@')}"
+        if time.time() < _rate_limited_until:
+            return None, (
+                f"I can't look up '{target}' yet — Slack is still rate-limiting "
+                f"directory reads. Wait a minute, say 'list Slack people', then try again."
+            )
+
+    hint = ""
+    if _user_cache:
+        sample = sorted({n.lstrip('@') for n in _user_cache if not n.startswith('@')})[:8]
+        if sample:
+            hint = f" People I can see include: {', '.join(sample)}."
     return None, (
         f"I could not find Slack channel or person '{target}'. "
-        f"Try #channel-name or @username, and invite the bot to private channels."
+        f"Try #channel-name or the person's Slack display name, and invite the bot "
+        f"to private channels.{hint}"
     )
 
 
