@@ -50,6 +50,10 @@ _CACHE_TTL = 300.0
 _notify_queue: asyncio.Queue | None = None
 _bot_user_id: str = ""
 _seen_events: set[str] = set()
+_socket_connected: bool = False
+_rate_limited_until: float = 0.0
+_last_api_call: float = 0.0
+_MIN_API_GAP = 1.05  # seconds — stay under Slack Tier-ish burst limits
 _SKIP_SUBTYPES = {
     "bot_message", "message_changed", "message_deleted", "channel_join",
     "channel_leave", "channel_topic", "channel_purpose", "channel_name",
@@ -127,37 +131,96 @@ def _notify_help() -> str:
 
 # ── HTTP ─────────────────────────────────────────────────────────────────────
 
+def _respect_rate_limit() -> None:
+    """Global client-side spacing so we stop stampeding Slack into HTTP 429."""
+    global _last_api_call, _rate_limited_until
+    now = time.time()
+    if now < _rate_limited_until:
+        time.sleep(_rate_limited_until - now)
+        now = time.time()
+    gap = now - _last_api_call
+    if gap < _MIN_API_GAP:
+        time.sleep(_MIN_API_GAP - gap)
+    _last_api_call = time.time()
+
+
+def _mark_rate_limited(retry_after: float | None = None) -> None:
+    global _rate_limited_until
+    wait = 30.0
+    if retry_after is not None:
+        try:
+            wait = max(5.0, float(retry_after))
+        except Exception:
+            wait = 30.0
+    _rate_limited_until = max(_rate_limited_until, time.time() + wait)
+    print(f"[Slack] rate-limited — cooling down {wait:.0f}s", flush=True)
+
+
 def _api(method: str, token: str, **params: Any) -> dict:
-    """Call a Slack Web API method. Returns the JSON body (always a dict)."""
-    # Prefer POST form for write methods; GET query for reads — Slack accepts both.
+    """Call a Slack Web API method. Returns the JSON body (always a dict).
+
+    Never raises on HTTP 429 — returns {"ok": False, "error": "ratelimited"}.
+    """
     write = method.startswith("chat.") or method in (
         "conversations.open", "conversations.join",
     )
     headers = {"Authorization": f"Bearer {token}"}
-    if write:
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-        r = requests.post(
-            f"{API}/{method}",
-            headers=headers,
-            data={k: v for k, v in params.items() if v is not None},
-            timeout=20,
-        )
-    else:
-        r = requests.get(
-            f"{API}/{method}",
-            headers=headers,
-            params={k: v for k, v in params.items() if v is not None},
-            timeout=20,
-        )
-    r.raise_for_status()
+    _respect_rate_limit()
+    try:
+        if write:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            r = requests.post(
+                f"{API}/{method}",
+                headers=headers,
+                data={k: v for k, v in params.items() if v is not None},
+                timeout=20,
+            )
+        else:
+            r = requests.get(
+                f"{API}/{method}",
+                headers=headers,
+                params={k: v for k, v in params.items() if v is not None},
+                timeout=20,
+            )
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"network:{e}"}
+
+    if r.status_code == 429:
+        _mark_rate_limited(r.headers.get("Retry-After"))
+        return {"ok": False, "error": "ratelimited"}
+    if r.status_code >= 400:
+        # Prefer Slack's JSON error when present; don't raise and blow the tool.
+        try:
+            data = r.json()
+            if isinstance(data, dict):
+                data.setdefault("ok", False)
+                data.setdefault("error", f"http_{r.status_code}")
+                return data
+        except Exception:
+            pass
+        return {"ok": False, "error": f"http_{r.status_code}"}
+
     data = r.json()
     if not isinstance(data, dict):
         return {"ok": False, "error": "bad_response"}
+    # Slack also rate-limits with 200 + ok:false error:ratelimited
+    if data.get("error") in ("ratelimited", "rate_limited"):
+        _mark_rate_limited()
     return data
 
 
 def _auth_test(token: str) -> dict:
     return _api("auth.test", token)
+
+
+def _friendly_api_error(err: str) -> str:
+    if err in ("ratelimited", "rate_limited"):
+        left = max(0, int(_rate_limited_until - time.time()))
+        return (
+            f"Slack is rate-limiting us right now. Wait about {left or 30} seconds "
+            f"and try again — too many API calls were made in a short burst."
+        )
+    return f"Slack error ({err})."
 
 
 # ── resolve people & channels ────────────────────────────────────────────────
@@ -182,6 +245,8 @@ def _refresh_caches(token: str, force: bool = False) -> None:
             cursor=cursor or "",
         )
         if not data.get("ok"):
+            if data.get("error") in ("ratelimited", "rate_limited"):
+                return  # keep prior cache; try later
             break
         for ch in data.get("channels") or []:
             name = (ch.get("name") or "").strip().lower()
@@ -201,6 +266,8 @@ def _refresh_caches(token: str, force: bool = False) -> None:
     while True:
         data = _api("users.list", token, limit=200, cursor=cursor or "")
         if not data.get("ok"):
+            if data.get("error") in ("ratelimited", "rate_limited"):
+                return
             break
         for u in data.get("members") or []:
             if u.get("deleted") or u.get("is_bot") or u.get("id") == "USLACKBOT":
@@ -330,6 +397,8 @@ def send_via_slack(receiver: str, message: str) -> str:
     data = _api("chat.postMessage", token, channel=channel, text=message)
     if not data.get("ok"):
         err = data.get("error", "unknown")
+        if err in ("ratelimited", "rate_limited"):
+            return _friendly_api_error(err)
         if err == "not_in_channel":
             # Try joining public channels, then retry once.
             join = _api("conversations.join", token, channel=channel)
@@ -391,6 +460,8 @@ def _read_history(token: str, target: str, limit: int = 8) -> str:
     )
     if not data.get("ok"):
         err = data.get("error", "unknown")
+        if err in ("ratelimited", "rate_limited"):
+            return _friendly_api_error(err)
         if err in ("not_in_channel", "channel_not_found"):
             return (
                 f"I cannot read {label}. Invite the bot into that channel "
@@ -426,16 +497,25 @@ def _status(token: str) -> str:
     global _bot_user_id
     data = _auth_test(token)
     if not data.get("ok"):
-        return f"Slack token looks invalid ({data.get('error', 'unknown')}). {_setup_help()}"
+        err = data.get("error", "unknown")
+        if err in ("ratelimited", "rate_limited"):
+            return _friendly_api_error(err)
+        return f"Slack token looks invalid ({err}). {_setup_help()}"
     team = data.get("team") or "workspace"
     user = data.get("user") or "bot"
     _bot_user_id = data.get("user_id") or _bot_user_id
-    notify = "live alerts ON" if notify_ready() else (
-        "live alerts OFF — add slack_app_token (xapp-…) and enable Socket Mode"
-    )
     cfg = _load_cfg()
     if cfg.get("slack_notify") is False:
         notify = "live alerts paused (say 'enable Slack notifications')"
+    elif _socket_connected:
+        notify = "live alerts CONNECTED and listening"
+    elif notify_ready():
+        notify = (
+            "live alert tokens present, but the socket is not connected yet "
+            "(often Slack rate-limit — wait a minute and restart Jarvis)"
+        )
+    else:
+        notify = "live alerts OFF — add slack_app_token (xapp-…) and enable Socket Mode"
     return f"Slack connected as @{user} in {team}; {notify}."
 
 
@@ -472,8 +552,10 @@ def _channel_label(token: str, channel_id: str) -> str:
     # DM / MPIM ids often start with D / G
     if channel_id.startswith("D"):
         return "a Slack DM"
+    # Avoid API storms while rate-limited — name lookup can wait.
+    if time.time() < _rate_limited_until:
+        return "Slack"
     try:
-        _refresh_caches(token)
         if channel_id in _id_to_channel:
             return f"#{_id_to_channel[channel_id]}"
         info = _api("conversations.info", token, channel=channel_id)
@@ -495,10 +577,9 @@ def _user_label(token: str, user_id: str) -> str:
         return "Someone"
     if user_id in _id_to_user:
         return _id_to_user[user_id]
+    if time.time() < _rate_limited_until:
+        return "Someone"
     try:
-        _refresh_caches(token)
-        if user_id in _id_to_user:
-            return _id_to_user[user_id]
         info = _api("users.info", token, user=user_id)
         if info.get("ok"):
             u = info.get("user") or {}
@@ -586,13 +667,19 @@ def get_notify_queue() -> asyncio.Queue:
 
 async def _open_socket_url(app_token: str) -> str:
     def _call() -> dict:
+        _respect_rate_limit()
         r = requests.post(
             f"{API}/apps.connections.open",
             headers={"Authorization": f"Bearer {app_token}"},
             timeout=20,
         )
-        r.raise_for_status()
-        return r.json()
+        if r.status_code == 429:
+            _mark_rate_limited(r.headers.get("Retry-After"))
+            return {"ok": False, "error": "ratelimited"}
+        try:
+            return r.json()
+        except Exception:
+            return {"ok": False, "error": f"http_{r.status_code}"}
 
     data = await asyncio.to_thread(_call)
     if not data.get("ok") or not data.get("url"):
@@ -605,10 +692,11 @@ async def run_slack_socket(log: Callable[[str], None] | None = None) -> None:
     Long-running Socket Mode client. Puts notify dicts on get_notify_queue().
     Reconnects with backoff. No-op loop while tokens are missing.
     """
+    global _socket_connected
     try:
         import websockets
     except ImportError:
-        print("[Slack] websockets package missing — live alerts disabled.")
+        print("[Slack] websockets package missing — live alerts disabled.", flush=True)
         if log:
             try:
                 log("SYS: Slack live alerts need the websockets package.")
@@ -617,7 +705,7 @@ async def run_slack_socket(log: Callable[[str], None] | None = None) -> None:
         return
 
     def _safe_log(msg: str) -> None:
-        print(f"[Slack] {msg}")
+        print(f"[Slack] {msg}", flush=True)
         if not log:
             return
         try:
@@ -630,19 +718,28 @@ async def run_slack_socket(log: Callable[[str], None] | None = None) -> None:
     _safe_log("Slack live-alert watcher starting…")
 
     while True:
+        _socket_connected = False
         if not notify_ready():
             await asyncio.sleep(15)
             continue
 
+        # Honor cool-down after HTTP 429 storms.
+        now = time.time()
+        if now < _rate_limited_until:
+            wait = _rate_limited_until - now
+            _safe_log(f"Waiting {wait:.0f}s for Slack rate-limit cool-down…")
+            await asyncio.sleep(wait)
+
         bot = _token()
         app = _app_token()
         try:
+            # Resolve bot id once; do NOT crawl the whole workspace on connect —
+            # that is what burned the rate limit earlier.
             await asyncio.to_thread(_ensure_bot_id, bot)
-            # Don't block connect on a full workspace crawl — refresh in background.
-            asyncio.create_task(asyncio.to_thread(_refresh_caches, bot))
             url = await _open_socket_url(app)
             _safe_log("Slack live alerts connected — listening for messages.")
             backoff = 2.0
+            _socket_connected = True
 
             async with websockets.connect(
                 url, ping_interval=20, ping_timeout=20, max_size=8_000_000,
@@ -668,7 +765,7 @@ async def run_slack_socket(log: Callable[[str], None] | None = None) -> None:
                             break
 
                     if mtype == "hello":
-                        print("[Slack] socket hello ok")
+                        print("[Slack] socket hello ok", flush=True)
                         continue
 
                     if mtype == "disconnect":
@@ -685,15 +782,17 @@ async def run_slack_socket(log: Callable[[str], None] | None = None) -> None:
                     print(
                         f"[Slack] event {etype}"
                         f"{(':' + event.get('subtype')) if event.get('subtype') else ''}"
-                        f" text={(event.get('text') or '')[:60]!r}"
+                        f" text={(event.get('text') or '')[:60]!r}",
+                        flush=True,
                     )
                     parsed = await asyncio.to_thread(_parse_message_event, bot, event)
                     if not parsed:
-                        print("[Slack] event skipped by filter")
+                        print("[Slack] event skipped by filter", flush=True)
                         continue
                     print(
                         f"[Slack] queued alert: {parsed.get('who')} in "
-                        f"{parsed.get('where')}: {(parsed.get('text') or '')[:60]}"
+                        f"{parsed.get('where')}: {(parsed.get('text') or '')[:60]}",
+                        flush=True,
                     )
                     try:
                         q.put_nowait(parsed)
@@ -708,13 +807,23 @@ async def run_slack_socket(log: Callable[[str], None] | None = None) -> None:
                             pass
 
         except asyncio.CancelledError:
+            _socket_connected = False
             raise
         except Exception as e:
+            _socket_connected = False
+            err = str(e)
+            if "ratelimited" in err:
+                wait = max(30.0, _rate_limited_until - time.time())
+                _safe_log(f"Slack socket rate-limited — retry in {wait:.0f}s.")
+                await asyncio.sleep(wait)
+                backoff = 5.0
+                continue
             _safe_log(f"Slack live alerts error — {e}. Retrying…")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 1.7, 60.0)
             continue
 
+        _socket_connected = False
         await asyncio.sleep(backoff)
         backoff = min(backoff * 1.4, 60.0)
 
@@ -769,8 +878,12 @@ def slack_messenger(parameters: dict = None, response=None, player=None,
             f"notify_on, or notify_off."
         )
     except requests.HTTPError as e:
+        if "429" in str(e):
+            return _friendly_api_error("ratelimited")
         return f"Slack HTTP error: {e}"
     except Exception as e:
+        if "ratelimited" in str(e).lower():
+            return _friendly_api_error("ratelimited")
         return f"Slack failed: {e}"
 
 

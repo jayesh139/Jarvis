@@ -2108,7 +2108,7 @@ class JarvisLive:
         pending: list[dict] = []
         last_spoken = 0.0
         logged_keys: set[str] = set()
-        print("[Slack] Alert drain running.")
+        print("[Slack] Alert drain running.", flush=True)
         while True:
             try:
                 if pending:
@@ -2133,7 +2133,7 @@ class JarvisLive:
                 logged_keys.add(key)
                 if len(logged_keys) > 300:
                     logged_keys = set(list(logged_keys)[-100:])
-                print(f"[Slack] ALERT {line}")
+                print(f"[Slack] ALERT {line}", flush=True)
                 try:
                     self.ui.write_log(f"SYS: {line}")
                 except Exception:
