@@ -608,13 +608,26 @@ async def run_slack_socket(log: Callable[[str], None] | None = None) -> None:
     try:
         import websockets
     except ImportError:
+        print("[Slack] websockets package missing — live alerts disabled.")
         if log:
-            log("SYS: Slack live alerts need the websockets package.")
+            try:
+                log("SYS: Slack live alerts need the websockets package.")
+            except Exception:
+                pass
         return
 
-    _log = log or (lambda m: print(f"[Slack] {m}"))
+    def _safe_log(msg: str) -> None:
+        print(f"[Slack] {msg}")
+        if not log:
+            return
+        try:
+            log(msg if msg.startswith("SYS:") else f"SYS: {msg}")
+        except Exception:
+            pass
+
     backoff = 2.0
     q = get_notify_queue()
+    _safe_log("Slack live-alert watcher starting…")
 
     while True:
         if not notify_ready():
@@ -624,10 +637,11 @@ async def run_slack_socket(log: Callable[[str], None] | None = None) -> None:
         bot = _token()
         app = _app_token()
         try:
-            _ensure_bot_id(bot)
-            await asyncio.to_thread(_refresh_caches, bot)
+            await asyncio.to_thread(_ensure_bot_id, bot)
+            # Don't block connect on a full workspace crawl — refresh in background.
+            asyncio.create_task(asyncio.to_thread(_refresh_caches, bot))
             url = await _open_socket_url(app)
-            _log("SYS: Slack live alerts connected.")
+            _safe_log("Slack live alerts connected — listening for messages.")
             backoff = 2.0
 
             async with websockets.connect(
@@ -637,6 +651,8 @@ async def run_slack_socket(log: Callable[[str], None] | None = None) -> None:
                     if not notify_ready():
                         break
                     try:
+                        if isinstance(raw, (bytes, bytearray)):
+                            raw = raw.decode("utf-8", errors="replace")
                         msg = json.loads(raw)
                     except Exception:
                         continue
@@ -651,9 +667,13 @@ async def run_slack_socket(log: Callable[[str], None] | None = None) -> None:
                         except Exception:
                             break
 
+                    if mtype == "hello":
+                        print("[Slack] socket hello ok")
+                        continue
+
                     if mtype == "disconnect":
                         reason = (msg.get("reason") or "server disconnect")
-                        _log(f"SYS: Slack socket disconnect ({reason}) — reconnecting.")
+                        _safe_log(f"Slack socket disconnect ({reason}) — reconnecting.")
                         break
 
                     if mtype != "events_api":
@@ -661,9 +681,20 @@ async def run_slack_socket(log: Callable[[str], None] | None = None) -> None:
 
                     payload = msg.get("payload") or {}
                     event = payload.get("event") or {}
+                    etype = event.get("type")
+                    print(
+                        f"[Slack] event {etype}"
+                        f"{(':' + event.get('subtype')) if event.get('subtype') else ''}"
+                        f" text={(event.get('text') or '')[:60]!r}"
+                    )
                     parsed = await asyncio.to_thread(_parse_message_event, bot, event)
                     if not parsed:
+                        print("[Slack] event skipped by filter")
                         continue
+                    print(
+                        f"[Slack] queued alert: {parsed.get('who')} in "
+                        f"{parsed.get('where')}: {(parsed.get('text') or '')[:60]}"
+                    )
                     try:
                         q.put_nowait(parsed)
                     except asyncio.QueueFull:
@@ -679,7 +710,7 @@ async def run_slack_socket(log: Callable[[str], None] | None = None) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            _log(f"SYS: Slack live alerts error — {e}. Retrying…")
+            _safe_log(f"Slack live alerts error — {e}. Retrying…")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 1.7, 60.0)
             continue

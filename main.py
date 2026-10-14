@@ -2088,7 +2088,15 @@ class JarvisLive:
             return
         if not notify_ready():
             print("[Slack] Live alerts idle — add slack_app_token (xapp-…) to enable.")
-        await run_slack_socket(log=lambda m: self.ui.write_log(m) if self.ui else print(m))
+
+        def _ui_log(msg: str) -> None:
+            try:
+                if self.ui:
+                    self.ui.write_log(msg)
+            except Exception:
+                pass
+
+        await run_slack_socket(log=_ui_log)
 
     async def _drain_slack_alerts(self) -> None:
         """Speak / log each inbound Slack message when the Live session can take it."""
@@ -2097,10 +2105,18 @@ class JarvisLive:
         except Exception:
             return
         q = get_notify_queue()
+        pending: list[dict] = []
         last_spoken = 0.0
+        logged_keys: set[str] = set()
+        print("[Slack] Alert drain running.")
         while True:
             try:
-                evt = await q.get()
+                if pending:
+                    evt = pending.pop(0)
+                else:
+                    evt = await asyncio.wait_for(q.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -2112,27 +2128,35 @@ class JarvisLive:
             text = (evt.get("text") or "").strip()
             preview = text if len(text) <= 120 else text[:117] + "…"
             line = f"Slack · {who} in {where}: {preview}"
-            try:
-                self.ui.write_log(f"SYS: {line}")
-            except Exception:
-                print(f"[Slack] {line}")
+            key = f"{evt.get('channel')}:{evt.get('ts')}"
+            if key not in logged_keys:
+                logged_keys.add(key)
+                if len(logged_keys) > 300:
+                    logged_keys = set(list(logged_keys)[-100:])
+                print(f"[Slack] ALERT {line}")
+                try:
+                    self.ui.write_log(f"SYS: {line}")
+                except Exception:
+                    pass
 
-            # Don't stack voice alerts on top of each other or mid-sentence.
+            # Hold the alert until Jarvis can actually speak it.
             now = time.monotonic()
-            if now - last_spoken < 4.0:
-                continue
-            if not self.session:
-                continue
             with self._speaking_lock:
                 speaking = self._is_speaking
-            if speaking:
-                # Already logged on the HUD; skip voice rather than interrupting.
+            if (
+                not self.session
+                or speaking
+                or (now - last_spoken) < 3.0
+            ):
+                pending.insert(0, evt)
+                await asyncio.sleep(0.8)
                 continue
 
             # Wake if sleeping so the alert is actually heard.
             if not self._awake:
                 try:
                     self.wake(reason="Slack message")
+                    await asyncio.sleep(0.3)
                 except Exception:
                     pass
 
@@ -2158,6 +2182,8 @@ class JarvisLive:
                 print(f"[Slack] Alert spoken: {who} @ {where}")
             except Exception as e:
                 print(f"[Slack] Could not speak alert: {e}")
+                pending.insert(0, evt)
+                await asyncio.sleep(1.5)
 
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
