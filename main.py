@@ -2140,16 +2140,18 @@ class JarvisLive:
                     pass
 
             # Hold the alert until Jarvis can actually speak it.
+            # Space alerts out — injecting into Live mid-tool/mic stream has
+            # caused Gemini websocket keepalive timeouts (TaskGroup reconnect).
             now = time.monotonic()
             with self._speaking_lock:
                 speaking = self._is_speaking
             if (
                 not self.session
                 or speaking
-                or (now - last_spoken) < 3.0
+                or (now - last_spoken) < 8.0
             ):
                 pending.insert(0, evt)
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(1.0)
                 continue
 
             # Wake if sleeping so the alert is actually heard.
@@ -2169,9 +2171,9 @@ class JarvisLive:
             prompt = (
                 f"[SLACK_ALERT] New Slack message from {who} in {where}:\n"
                 f"\"{text}\"\n\n"
-                f"Briefly notify the user in {lang}. One or two short sentences. "
+                f"Briefly notify the user in {lang}. One short sentence only. "
                 f"Name who wrote and where. Do not invent extra details. "
-                f"Do not call tools unless they ask to reply."
+                f"Do not call tools."
             )
             try:
                 await self.session.send_client_content(
@@ -2179,11 +2181,12 @@ class JarvisLive:
                     turn_complete=True,
                 )
                 last_spoken = time.monotonic()
-                print(f"[Slack] Alert spoken: {who} @ {where}")
+                print(f"[Slack] Alert spoken: {who} @ {where}", flush=True)
             except Exception as e:
-                print(f"[Slack] Could not speak alert: {e}")
-                pending.insert(0, evt)
-                await asyncio.sleep(1.5)
+                print(f"[Slack] Could not speak alert: {e}", flush=True)
+                # Don't hot-loop the same alert into a dying socket.
+                last_spoken = time.monotonic()
+                await asyncio.sleep(2.0)
 
     # ── Phone audio relay ────────────────────────────────────────────────────────
 

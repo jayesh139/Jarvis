@@ -7,6 +7,9 @@
 # ── Secrets. Committing any of these publishes them. ──────────────────────────
 # api_keys.json: Gemini API key + per-plugin credentials
 config/api_keys.json
+# Local Slack directory cache (names/ids) — machine-specific, regen on demand
+config/slack_directory_cache.json
+config/.firewall_prompt_skip
 # certs/: dashboard TLS private key and certificate
 config/certs/
 # whatsapp_web/: a LINKED WhatsApp session — never commit

@@ -36,6 +36,7 @@ import requests
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_FILE = BASE_DIR / "config" / "api_keys.json"
+DIR_CACHE_FILE = BASE_DIR / "config" / "slack_directory_cache.json"
 API = "https://slack.com/api"
 
 # Cache channel / user lookups for the process lifetime (names rarely change).
@@ -45,6 +46,7 @@ _id_to_channel: dict[str, str] = {}  # channel id -> #name
 _id_to_user: dict[str, str] = {}     # user id -> display name
 _cache_ts = 0.0
 _CACHE_TTL = 300.0
+_dir_cache_loaded = False
 
 # Live notify: shared queue drained by main.py
 _notify_queue: asyncio.Queue | None = None
@@ -225,10 +227,63 @@ def _friendly_api_error(err: str) -> str:
 
 # ── resolve people & channels ────────────────────────────────────────────────
 
+def _load_dir_cache() -> None:
+    """Hydrate name maps from disk so alerts work even while Slack is rate-limiting."""
+    global _dir_cache_loaded, _cache_ts
+    if _dir_cache_loaded:
+        return
+    _dir_cache_loaded = True
+    try:
+        data = json.loads(DIR_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    _channel_cache.update({str(k).lower(): str(v) for k, v in (data.get("channels") or {}).items()})
+    _user_cache.update({str(k).lower(): str(v) for k, v in (data.get("users") or {}).items()})
+    _id_to_channel.update({str(k): str(v) for k, v in (data.get("id_to_channel") or {}).items()})
+    _id_to_user.update({str(k): str(v) for k, v in (data.get("id_to_user") or {}).items()})
+    try:
+        _cache_ts = float(data.get("ts") or 0)
+    except Exception:
+        _cache_ts = 0.0
+
+
+def _save_dir_cache() -> None:
+    try:
+        DIR_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ts": _cache_ts,
+            "channels": _channel_cache,
+            "users": _user_cache,
+            "id_to_channel": _id_to_channel,
+            "id_to_user": _id_to_user,
+        }
+        DIR_CACHE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[Slack] could not save directory cache: {e}", flush=True)
+
+
+def _remember_user(uid: str, name: str) -> None:
+    name = (name or "").strip()
+    if not uid or not name or name.lower() == "someone":
+        return
+    _id_to_user[uid] = name
+    low = name.lower()
+    _user_cache[low] = uid
+    _user_cache[f"@{low}"] = uid
+    for part in re.split(r"[\s._-]+", low):
+        if len(part) >= 3:
+            _user_cache.setdefault(part, uid)
+
+
 def _refresh_caches(token: str, force: bool = False) -> None:
     global _cache_ts
+    _load_dir_cache()
     now = time.time()
     if not force and _channel_cache and _user_cache and (now - _cache_ts) < _CACHE_TTL:
+        return
+    if time.time() < _rate_limited_until and not force:
         return
 
     # Conversations the bot can see (public + private).
@@ -298,15 +353,19 @@ def _refresh_caches(token: str, force: bool = False) -> None:
         if not cursor:
             break
 
-    _channel_cache.clear()
-    _channel_cache.update(channels)
-    _user_cache.clear()
-    _user_cache.update(users)
-    _id_to_channel.clear()
-    _id_to_channel.update(id_ch)
-    _id_to_user.clear()
-    _id_to_user.update(id_u)
-    _cache_ts = now
+    if channels:
+        _channel_cache.clear()
+        _channel_cache.update(channels)
+        _id_to_channel.clear()
+        _id_to_channel.update(id_ch)
+    if users:
+        _user_cache.clear()
+        _user_cache.update(users)
+        _id_to_user.clear()
+        _id_to_user.update(id_u)
+    if channels or users:
+        _cache_ts = now
+        _save_dir_cache()
 
 
 def _looks_like_id(value: str) -> bool:
@@ -358,8 +417,14 @@ def _resolve_target(token: str, raw: str) -> tuple[str | None, str]:
     if _looks_like_id(target):
         return target.upper(), target
 
+    _load_dir_cache()
     # If caches are empty (common right after a rate-limit storm), force a refresh.
     if not _user_cache or not _channel_cache:
+        if time.time() < _rate_limited_until:
+            return None, (
+                f"I can't look up '{target}' yet — Slack is rate-limiting directory "
+                f"reads. Wait a minute, then say 'list Slack people' and try again."
+            )
         _refresh_caches(token, force=True)
     else:
         _refresh_caches(token)
@@ -476,30 +541,49 @@ def send_via_slack(receiver: str, message: str) -> str:
 
 
 def _list_channels(token: str, limit: int = 25) -> str:
-    _refresh_caches(token, force=True)
+    _load_dir_cache()
+    if time.time() >= _rate_limited_until:
+        _refresh_caches(token, force=not _channel_cache)
+    elif not _channel_cache:
+        return _friendly_api_error("ratelimited")
     names = sorted({n.lstrip("#") for n in _channel_cache if not n.startswith("#")})
     if not names:
+        if time.time() < _rate_limited_until:
+            return _friendly_api_error("ratelimited")
         return "I cannot see any Slack channels yet. Check the bot scopes and reinstall."
     show = names[: max(1, min(limit, 50))]
     extra = len(names) - len(show)
     body = ", ".join(f"#{n}" for n in show)
     if extra > 0:
         body += f" (+{extra} more)"
-    return f"Slack channels I can see: {body}."
+    cached = " (from cache — Slack is cooling down)" if time.time() < _rate_limited_until else ""
+    return f"Slack channels I can see{cached}: {body}."
 
 
 def _list_people(token: str, limit: int = 25) -> str:
-    _refresh_caches(token, force=True)
-    # Prefer display-ish names without the @ duplicate keys.
-    names = sorted({n.lstrip("@") for n in _user_cache if not n.startswith("@")})
+    _load_dir_cache()
+    if time.time() >= _rate_limited_until:
+        _refresh_caches(token, force=not _user_cache)
+    elif not _user_cache:
+        return _friendly_api_error("ratelimited")
+    # Prefer real display names (with spaces) first, then handles.
+    display = sorted({n.lstrip("@") for n in _user_cache if not n.startswith("@") and " " in n})
+    handles = sorted({n.lstrip("@") for n in _user_cache if not n.startswith("@") and " " not in n})
+    first_names = {d.split()[0].lower() for d in display}
+    names = display + [h for h in handles if h.lower() not in first_names]
     if not names:
+        names = sorted({n.lstrip("@") for n in _user_cache if not n.startswith("@")})
+    if not names:
+        if time.time() < _rate_limited_until:
+            return _friendly_api_error("ratelimited")
         return "I cannot see workspace members. Add users:read and reinstall the app."
     show = names[: max(1, min(limit, 50))]
     extra = len(names) - len(show)
     body = ", ".join(show)
     if extra > 0:
         body += f" (+{extra} more)"
-    return f"Slack people I can message: {body}."
+    cached = " (from cache — Slack is cooling down)" if time.time() < _rate_limited_until else ""
+    return f"Slack people I can message{cached}: {body}."
 
 
 def _read_history(token: str, target: str, limit: int = 8) -> str:
@@ -633,11 +717,26 @@ def _channel_label(token: str, channel_id: str) -> str:
     return "Slack"
 
 
-def _user_label(token: str, user_id: str) -> str:
+def _user_label(token: str, user_id: str, event: dict | None = None) -> str:
+    _load_dir_cache()
     if not user_id:
         return "Someone"
     if user_id in _id_to_user:
         return _id_to_user[user_id]
+    # Prefer fields already on the event — no extra API call.
+    if event:
+        profile = event.get("user_profile") or {}
+        for key in ("display_name", "real_name", "name"):
+            val = (profile.get(key) or "").strip()
+            if val:
+                _remember_user(user_id, val)
+                _save_dir_cache()
+                return val
+        uname = (event.get("username") or "").strip()
+        if uname:
+            _remember_user(user_id, uname)
+            _save_dir_cache()
+            return uname
     if time.time() < _rate_limited_until:
         return "Someone"
     try:
@@ -651,7 +750,8 @@ def _user_label(token: str, user_id: str) -> str:
                 or (u.get("name") or "").strip()
                 or "Someone"
             )
-            _id_to_user[user_id] = name
+            _remember_user(user_id, name)
+            _save_dir_cache()
             return name
     except Exception:
         pass
@@ -674,7 +774,11 @@ def _strip_slack_markup(text: str) -> str:
 
 def _parse_message_event(token: str, event: dict) -> dict | None:
     """Turn a Slack message event into a notify payload, or None to skip."""
-    if (event.get("type") or "") != "message":
+    etype = event.get("type") or ""
+    # app_mention duplicates the message event for @bot — ignore it.
+    if etype == "app_mention":
+        return None
+    if etype != "message":
         return None
     subtype = event.get("subtype") or ""
     if subtype in _SKIP_SUBTYPES:
@@ -708,7 +812,7 @@ def _parse_message_event(token: str, event: dict) -> dict | None:
         _seen_events.update(keep)
 
     where = _channel_label(token, event.get("channel") or "")
-    who = _user_label(token, uid)
+    who = _user_label(token, uid, event=event)
     return {
         "who": who,
         "where": where,
