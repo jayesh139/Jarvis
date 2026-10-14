@@ -301,8 +301,6 @@ def _refresh_caches(token: str, force: bool = False) -> None:
             cursor=cursor or "",
         )
         if not data.get("ok"):
-            if data.get("error") in ("ratelimited", "rate_limited"):
-                return  # keep prior cache; try later
             break
         for ch in data.get("channels") or []:
             name = (ch.get("name") or "").strip().lower()
@@ -324,12 +322,10 @@ def _refresh_caches(token: str, force: bool = False) -> None:
         data = _api("users.list", token, limit=200, cursor=cursor or "")
         if not data.get("ok"):
             err = data.get("error") or "unknown"
-            if err in ("ratelimited", "rate_limited"):
-                return
             if err == "missing_scope":
                 needed = data.get("needed") or "users:read"
                 _last_users_error = f"missing_scope:{needed}"
-            else:
+            elif err not in ("ratelimited", "rate_limited"):
                 _last_users_error = err
             break
         _last_users_error = ""
@@ -362,18 +358,27 @@ def _refresh_caches(token: str, force: bool = False) -> None:
         if not cursor:
             break
 
+    # Save whatever we collected — even a partial page beat a 1-person stale cache.
     if channels:
         _channel_cache.clear()
         _channel_cache.update(channels)
         _id_to_channel.clear()
         _id_to_channel.update(id_ch)
-    if users:
-        _user_cache.clear()
-        _user_cache.update(users)
-        _id_to_user.clear()
+    if id_u:
+        # Merge aliases for these ids; replace id map with the fuller pull.
         _id_to_user.update(id_u)
-    if channels or users:
-        _cache_ts = now
+        for n, uid in users.items():
+            _user_cache[n] = uid
+        # If this looks like a real directory (not one leftover name), replace.
+        if len(id_u) >= 5:
+            _user_cache.clear()
+            _user_cache.update(users)
+            _id_to_user.clear()
+            _id_to_user.update(id_u)
+            for uid, display in id_u.items():
+                _remember_user(uid, display)
+    if channels or id_u:
+        _cache_ts = time.time()
         _save_dir_cache()
 
 
@@ -551,10 +556,12 @@ def send_via_slack(receiver: str, message: str) -> str:
 
 def _list_channels(token: str, limit: int = 25) -> str:
     _load_dir_cache()
-    if time.time() >= _rate_limited_until:
-        _refresh_caches(token, force=not _channel_cache)
-    elif not _channel_cache:
+    if time.time() < _rate_limited_until and not _channel_cache:
         return _friendly_api_error("ratelimited")
+    # Explicit list action always refreshes when allowed — a tiny/stale cache
+    # (e.g. one remembered name) must not block the full directory pull.
+    if time.time() >= _rate_limited_until:
+        _refresh_caches(token, force=True)
     names = sorted({n.lstrip("#") for n in _channel_cache if not n.startswith("#")})
     if not names:
         if time.time() < _rate_limited_until:
@@ -565,23 +572,22 @@ def _list_channels(token: str, limit: int = 25) -> str:
     body = ", ".join(f"#{n}" for n in show)
     if extra > 0:
         body += f" (+{extra} more)"
-    cached = " (from cache — Slack is cooling down)" if time.time() < _rate_limited_until else ""
-    return f"Slack channels I can see{cached}: {body}."
+    return f"Slack channels I can see ({len(names)} total): {body}."
 
 
 def _list_people(token: str, limit: int = 25) -> str:
     _load_dir_cache()
-    if time.time() >= _rate_limited_until:
-        _refresh_caches(token, force=not _user_cache)
-    elif not _user_cache:
+    if time.time() < _rate_limited_until and len(_id_to_user) < 5:
         return _friendly_api_error("ratelimited")
-    # Prefer real display names (with spaces) first, then handles.
-    display = sorted({n.lstrip("@") for n in _user_cache if not n.startswith("@") and " " in n})
-    handles = sorted({n.lstrip("@") for n in _user_cache if not n.startswith("@") and " " not in n})
-    first_names = {d.split()[0].lower() for d in display}
-    names = display + [h for h in handles if h.lower() not in first_names]
-    if not names:
-        names = sorted({n.lstrip("@") for n in _user_cache if not n.startswith("@")})
+    # Always try a full pull on this command — otherwise a 1-person cache
+    # from a previous DM look-up permanently hides the rest of the workspace.
+    if time.time() >= _rate_limited_until:
+        print("[Slack] refreshing people directory…", flush=True)
+        _refresh_caches(token, force=True)
+        print(f"[Slack] directory now has {len(_id_to_user)} people", flush=True)
+
+    # Unique people by user id (display name), not every cache alias.
+    names = sorted({name for name in _id_to_user.values() if name}, key=str.lower)
     if not names:
         if time.time() < _rate_limited_until:
             return _friendly_api_error("ratelimited")
@@ -599,13 +605,15 @@ def _list_people(token: str, limit: int = 25) -> str:
             "I cannot see workspace members. Add the bot scope 'users:read' in "
             "OAuth & Permissions, reinstall the app, then try again."
         )
-    show = names[: max(1, min(limit, 50))]
+    show = names[: max(1, min(int(limit or 25), 40))]
     extra = len(names) - len(show)
     body = ", ".join(show)
     if extra > 0:
         body += f" (+{extra} more)"
-    cached = " (from cache — Slack is cooling down)" if time.time() < _rate_limited_until else ""
-    return f"Slack people I can message{cached}: {body}."
+    return (
+        f"Slack people I can message ({len(names)} total). "
+        f"Here are some: {body}."
+    )
 
 
 def _read_history(token: str, target: str, limit: int = 8) -> str:
