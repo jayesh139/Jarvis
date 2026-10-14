@@ -34,6 +34,8 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
     "vscode":             {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
     "visual studio code": {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
     "code":               {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
+    "cursor":             {"Windows": "Cursor",                  "Darwin": "Cursor",               "Linux": "cursor"},
+    "cursor ide":         {"Windows": "Cursor",                  "Darwin": "Cursor",               "Linux": "cursor"},
     "terminal":           {"Windows": "wt",                      "Darwin": "Terminal",             "Linux": "x-terminal-emulator"},
     "cmd":                {"Windows": "cmd.exe",                 "Darwin": "Terminal",             "Linux": "bash"},
     "powershell":         {"Windows": "powershell.exe",          "Darwin": "Terminal",             "Linux": "bash"},

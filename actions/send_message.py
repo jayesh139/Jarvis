@@ -205,6 +205,17 @@ def _send_discord(receiver: str, message: str) -> str:
     return _desktop_send("Discord", receiver, message)
 
 
+def _send_slack(receiver: str, message: str) -> str:
+    """Prefer the Slack Web API; fall back to desktop typing if unavailable."""
+    try:
+        from actions.slack_messenger import send_via_slack, is_configured
+        if is_configured():
+            return send_via_slack(receiver, message)
+    except Exception as e:
+        print(f"[SendMessage] Slack API unavailable ({e}) — typing blind.")
+    return _desktop_send("Slack", receiver, message)
+
+
 def _send_instagram(receiver: str, message: str) -> str:
     _require_pyautogui()
 
@@ -260,6 +271,7 @@ _PLATFORM_MAP = [
     ({"instagram", "ig", "insta"},            _send_instagram),
     ({"signal"},                               _send_signal),
     ({"discord"},                              _send_discord),
+    ({"slack"},                                _send_slack),
     ({"messenger", "facebook", "fb"},         _send_messenger),
 ]
 
@@ -316,8 +328,10 @@ def send_message(
 TOOL = {
     "name": "send_message",
     "description": (
-        "Sends a text message via WhatsApp, Telegram, or another messaging "
-        "platform. Write 'message_text' in the USER'S OWN LANGUAGE, exactly "
+        "Sends a text message via WhatsApp, Telegram, Slack, or another "
+        "messaging platform. For Slack specifically, prefer slack_messenger "
+        "when available; this still works with platform='slack'. "
+        "Write 'message_text' in the USER'S OWN LANGUAGE, exactly "
         "what they asked to be said. If the result says the message was NOT "
         "sent, repeat that plainly along with the reason it gives — never "
         "tell the user a message was sent unless the result said it was."
