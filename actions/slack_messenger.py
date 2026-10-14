@@ -47,6 +47,7 @@ _id_to_user: dict[str, str] = {}     # user id -> display name
 _cache_ts = 0.0
 _CACHE_TTL = 300.0
 _dir_cache_loaded = False
+_last_users_error: str = ""
 
 # Live notify: shared queue drained by main.py
 _notify_queue: asyncio.Queue | None = None
@@ -315,15 +316,23 @@ def _refresh_caches(token: str, force: bool = False) -> None:
             break
 
     # Workspace users — match by display name, real name, or @handle.
+    global _last_users_error
     cursor = None
     users: dict[str, str] = {}
     id_u: dict[str, str] = {}
     while True:
         data = _api("users.list", token, limit=200, cursor=cursor or "")
         if not data.get("ok"):
-            if data.get("error") in ("ratelimited", "rate_limited"):
+            err = data.get("error") or "unknown"
+            if err in ("ratelimited", "rate_limited"):
                 return
+            if err == "missing_scope":
+                needed = data.get("needed") or "users:read"
+                _last_users_error = f"missing_scope:{needed}"
+            else:
+                _last_users_error = err
             break
+        _last_users_error = ""
         for u in data.get("members") or []:
             if u.get("deleted") or u.get("is_bot") or u.get("id") == "USLACKBOT":
                 continue
@@ -576,7 +585,20 @@ def _list_people(token: str, limit: int = 25) -> str:
     if not names:
         if time.time() < _rate_limited_until:
             return _friendly_api_error("ratelimited")
-        return "I cannot see workspace members. Add users:read and reinstall the app."
+        if _last_users_error.startswith("missing_scope"):
+            needed = _last_users_error.split(":", 1)[-1]
+            return (
+                f"Slack blocked the people list — missing bot scope '{needed}'. "
+                f"In api.slack.com/apps → your Jarvis app → OAuth & Permissions → "
+                f"Bot Token Scopes, add '{needed}', then click Reinstall to Workspace "
+                f"and try 'list Slack people' again."
+            )
+        if _last_users_error:
+            return f"I cannot see workspace members ({_last_users_error})."
+        return (
+            "I cannot see workspace members. Add the bot scope 'users:read' in "
+            "OAuth & Permissions, reinstall the app, then try again."
+        )
     show = names[: max(1, min(limit, 50))]
     extra = len(names) - len(show)
     body = ", ".join(show)
