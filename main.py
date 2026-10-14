@@ -2077,6 +2077,88 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Proactive] ⚠️ {e}")
 
+    # ── Slack live alerts (Socket Mode) ─────────────────────────────────────────
+
+    async def _run_slack_socket(self) -> None:
+        """Keep a Slack Socket Mode connection for inbound message events."""
+        try:
+            from actions.slack_messenger import run_slack_socket, notify_ready
+        except Exception as e:
+            print(f"[Slack] Notifier unavailable: {e}")
+            return
+        if not notify_ready():
+            print("[Slack] Live alerts idle — add slack_app_token (xapp-…) to enable.")
+        await run_slack_socket(log=lambda m: self.ui.write_log(m) if self.ui else print(m))
+
+    async def _drain_slack_alerts(self) -> None:
+        """Speak / log each inbound Slack message when the Live session can take it."""
+        try:
+            from actions.slack_messenger import get_notify_queue
+        except Exception:
+            return
+        q = get_notify_queue()
+        last_spoken = 0.0
+        while True:
+            try:
+                evt = await q.get()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await asyncio.sleep(1.0)
+                continue
+
+            who = (evt.get("who") or "Someone").strip()
+            where = (evt.get("where") or "Slack").strip()
+            text = (evt.get("text") or "").strip()
+            preview = text if len(text) <= 120 else text[:117] + "…"
+            line = f"Slack · {who} in {where}: {preview}"
+            try:
+                self.ui.write_log(f"SYS: {line}")
+            except Exception:
+                print(f"[Slack] {line}")
+
+            # Don't stack voice alerts on top of each other or mid-sentence.
+            now = time.monotonic()
+            if now - last_spoken < 4.0:
+                continue
+            if not self.session:
+                continue
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if speaking:
+                # Already logged on the HUD; skip voice rather than interrupting.
+                continue
+
+            # Wake if sleeping so the alert is actually heard.
+            if not self._awake:
+                try:
+                    self.wake(reason="Slack message")
+                except Exception:
+                    pass
+
+            memory = await asyncio.to_thread(load_memory)
+            lang_e = memory.get("identity", {}).get("language", {})
+            lang = (
+                (lang_e.get("value", "") if isinstance(lang_e, dict) else str(lang_e)).strip()
+                or "English"
+            )
+            prompt = (
+                f"[SLACK_ALERT] New Slack message from {who} in {where}:\n"
+                f"\"{text}\"\n\n"
+                f"Briefly notify the user in {lang}. One or two short sentences. "
+                f"Name who wrote and where. Do not invent extra details. "
+                f"Do not call tools unless they ask to reply."
+            )
+            try:
+                await self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": prompt}]},
+                    turn_complete=True,
+                )
+                last_spoken = time.monotonic()
+                print(f"[Slack] Alert spoken: {who} @ {where}")
+            except Exception as e:
+                print(f"[Slack] Could not speak alert: {e}")
+
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
     async def _relay_phone_audio(self) -> None:
@@ -2172,6 +2254,10 @@ class JarvisLive:
         except Exception as e:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
+
+        # Slack Socket Mode — lives for the whole process (survives Live reconnects)
+        asyncio.create_task(self._run_slack_socket())
+        asyncio.create_task(self._drain_slack_alerts())
 
         while True:
             try:
