@@ -461,6 +461,7 @@ class DashboardServer:
         self._token_keys: dict[str, str]  = {}   # auth_token → session_key
         self._aes_cache:  dict[str, bytes]= {}   # session_key → AES bytes
         self._clients: set[WebSocket]     = set()
+        self._speaker_clients: set[WebSocket] = set()  # phone playback of Jarvis voice
         self._history: list[dict]         = []
         self._command_queue               = asyncio.Queue()
         self._wake_callback               = None
@@ -532,6 +533,48 @@ class DashboardServer:
             except Exception:
                 dead.add(ws)
         self._clients -= dead
+
+    # ── phone speaker (Jarvis Live PCM → phone) ─────────────────────────
+
+    def has_speaker_clients(self) -> bool:
+        """True while at least one phone is subscribed to Jarvis voice."""
+        return bool(self._speaker_clients)
+
+    async def push_speaker_audio(self, pcm: bytes) -> None:
+        """Fan-out one PCM16 mono chunk (24 kHz) to every phone speaker socket.
+
+        Slow or dead clients are dropped so laptop playback never stalls.
+        """
+        if not pcm or not self._speaker_clients:
+            return
+        dead: set[WebSocket] = set()
+
+        async def _one(ws: WebSocket) -> None:
+            try:
+                await asyncio.wait_for(ws.send_bytes(pcm), timeout=0.15)
+            except Exception:
+                dead.add(ws)
+
+        await asyncio.gather(
+            *[_one(ws) for ws in list(self._speaker_clients)],
+            return_exceptions=True,
+        )
+        if dead:
+            self._speaker_clients -= dead
+
+    async def flush_speaker_audio(self) -> None:
+        """Tell phones to drop buffered Jarvis audio (barge-in / interrupt)."""
+        if not self._speaker_clients:
+            return
+        dead: set[WebSocket] = set()
+        msg = {"type": "flush"}
+        for ws in list(self._speaker_clients):
+            try:
+                await asyncio.wait_for(ws.send_json(msg), timeout=0.1)
+            except Exception:
+                dead.add(ws)
+        if dead:
+            self._speaker_clients -= dead
 
     # ── FastAPI app ───────────────────────────────────────────────────────
 
@@ -717,6 +760,36 @@ class DashboardServer:
             finally:
                 asyncio.create_task(self.broadcast(
                     {"type": "sys", "text": "Phone microphone stopped."}
+                ))
+
+        # ── Phone speaker — Jarvis Live PCM → phone (earphones) ───────────────
+
+        @app.websocket("/ws/phone-speaker")
+        async def phone_speaker_ws(websocket: WebSocket, token: str = ""):
+            tok = token.strip()
+            if not tok or tok not in self._tokens:
+                await websocket.close(code=4001)
+                return
+            await websocket.accept()
+            self._speaker_clients.add(websocket)
+            asyncio.create_task(self.broadcast(
+                {"type": "sys", "text": "Phone speaker live — Jarvis voice routes here."}
+            ))
+            try:
+                # Keep the socket open; laptop pushes binary PCM.
+                # Ignore anything inbound (keepalive pings, etc.).
+                while True:
+                    msg = await websocket.receive()
+                    if msg.get("type") == "websocket.disconnect":
+                        break
+            except WebSocketDisconnect:
+                pass
+            except Exception:
+                pass
+            finally:
+                self._speaker_clients.discard(websocket)
+                asyncio.create_task(self.broadcast(
+                    {"type": "sys", "text": "Phone speaker disconnected."}
                 ))
 
         # ── File sharing ──────────────────────────────────────────────────────

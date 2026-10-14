@@ -222,6 +222,109 @@
       if (m.type === 'file_received') _onFileReceived(m);
     };
 
+    // ── Phone speaker — play Jarvis Live PCM through phone / earphones ─────
+    // Same 24 kHz int16 mono stream the laptop plays. No second TTS.
+    const SPEAKER_RATE = 24000;
+    let _spkWs = null;
+    let _spkCtx = null;
+    let _spkNext = 0;
+    let _spkSources = [];
+    let _spkUnlocked = false;
+
+    function _flushSpeaker() {
+      for (const s of _spkSources) {
+        try { s.stop(); } catch (_) {}
+      }
+      _spkSources = [];
+      if (_spkCtx) _spkNext = _spkCtx.currentTime;
+    }
+
+    async function _unlockSpeaker() {
+      if (_spkUnlocked && _spkCtx && _spkCtx.state !== 'closed') {
+        if (_spkCtx.state === 'suspended') await _spkCtx.resume();
+        return;
+      }
+      try {
+        _spkCtx = new AudioContext({ sampleRate: SPEAKER_RATE });
+      } catch (_) {
+        _spkCtx = new AudioContext();
+      }
+      if (_spkCtx.state === 'suspended') await _spkCtx.resume();
+      // Silent blip so mobile browsers treat this as a user-gesture unlock.
+      try {
+        const b = _spkCtx.createBuffer(1, 1, _spkCtx.sampleRate);
+        const src = _spkCtx.createBufferSource();
+        src.buffer = b;
+        src.connect(_spkCtx.destination);
+        src.start();
+      } catch (_) {}
+      _spkNext = _spkCtx.currentTime;
+      _spkUnlocked = true;
+    }
+
+    function _playSpeakerPcm(arrayBuffer) {
+      if (!_spkCtx || _spkCtx.state === 'closed') return;
+      if (_spkCtx.state === 'suspended') _spkCtx.resume().catch(() => {});
+      const int16 = new Int16Array(arrayBuffer);
+      if (!int16.length) return;
+      const f32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
+      // Buffer is always 24 kHz (Live PCM rate); the AudioContext resamples
+      // if the phone refused that rate at construction time.
+      const buf = _spkCtx.createBuffer(1, f32.length, SPEAKER_RATE);
+      buf.copyToChannel(f32, 0);
+      const src = _spkCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(_spkCtx.destination);
+      const start = Math.max(_spkCtx.currentTime + 0.03, _spkNext);
+      try {
+        src.start(start);
+      } catch (_) {
+        return;
+      }
+      _spkNext = start + buf.duration;
+      _spkSources.push(src);
+      src.onended = () => {
+        const i = _spkSources.indexOf(src);
+        if (i >= 0) _spkSources.splice(i, 1);
+      };
+      // Bound memory if a long reply piles up sources.
+      if (_spkSources.length > 40) {
+        const old = _spkSources.shift();
+        try { old.stop(); } catch (_) {}
+      }
+    }
+
+    function _connectSpeaker() {
+      if (_spkWs && (_spkWs.readyState === 0 || _spkWs.readyState === 1)) return;
+      const url = `${_wsProto}://${location.host}/ws/phone-speaker?token=${encodeURIComponent(_authToken)}`;
+      const sWs = new WebSocket(url);
+      sWs.binaryType = 'arraybuffer';
+      sWs.onopen = () => {
+        sys('Phone speaker linked — tap WAKE or 🎤 once to unlock audio.');
+      };
+      sWs.onmessage = (e) => {
+        if (typeof e.data === 'string') {
+          try {
+            const m = JSON.parse(e.data);
+            if (m.type === 'flush') _flushSpeaker();
+          } catch (_) {}
+          return;
+        }
+        _playSpeakerPcm(e.data);
+      };
+      sWs.onclose = () => {
+        _spkWs = null;
+        setTimeout(_connectSpeaker, 1500);
+      };
+      sWs.onerror = () => { try { sWs.close(); } catch (_) {} };
+      _spkWs = sWs;
+    }
+
+    _connectSpeaker();
+    // First tap anywhere unlocks Web Audio on iOS / Android.
+    document.body.addEventListener('pointerdown', () => { _unlockSpeaker(); }, { once: true });
+
     function setStatus(s) {
       if (s === 'active') {
         pill.className = 'pill on'; stTxt.textContent = 'Active'; wake.classList.remove('show');
@@ -373,6 +476,7 @@
 
     // ── Commands ──────────────────────────────────────────────────────────────
     function doSend() {
+      _unlockSpeaker();
       const inp = document.getElementById('inp');
       const txt = inp.value.trim();
       if (!txt) return;
@@ -388,6 +492,7 @@
     }
 
     function doWake() {
+      _unlockSpeaker();
       sys('Sending wake signal…');
       _authFetch('/api/wake', { method: 'POST' });
     }
@@ -464,6 +569,7 @@
 
     async function doMic() {
       if (_voiceWs) { _stopVoice(); return; }
+      await _unlockSpeaker();
 
       if (!navigator.mediaDevices?.getUserMedia) {
         _showVoiceSetup();

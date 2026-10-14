@@ -963,6 +963,14 @@ class JarvisLive:
         self._play_cursor = 0.0     # next batch starts a fresh timeline
         if self._turn_done_event:
             self._turn_done_event.clear()
+        # Drop any PCM already buffered on the phone speaker path.
+        if self._dashboard is not None and self._loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._dashboard.flush_speaker_audio(), self._loop
+                )
+            except Exception:
+                pass
         self.ui.write_log("SYS: Interrupted — listening...")
 
     def speak(self, text: str):
@@ -1764,8 +1772,28 @@ class JarvisLive:
                 except Exception:
                     pass
 
+                pcm_bytes = bytes(batch)
+
+                # Fan-out the same Live PCM to any phone Remote Dashboard
+                # speaker sockets — earphones on the phone hear Jarvis without
+                # ElevenLabs or a second TTS path.
+                phone_listening = False
+                if self._dashboard is not None:
+                    try:
+                        phone_listening = self._dashboard.has_speaker_clients()
+                        if phone_listening:
+                            await self._dashboard.push_speaker_audio(pcm_bytes)
+                    except Exception as _phone_e:
+                        print(f"[JARVIS] ⚠️  Phone speaker push: {_phone_e}")
+
+                # When a phone is pulling voice, mute the laptop speakers so
+                # the room does not talk to an empty chair (and so BLE buds on
+                # the phone are the only place the reply is heard).
+                if phone_listening:
+                    continue
+
                 try:
-                    await asyncio.to_thread(stream.write, bytes(batch))
+                    await asyncio.to_thread(stream.write, pcm_bytes)
                 except (RuntimeError, asyncio.CancelledError):
                     break   # executor shutting down — exit cleanly
         except Exception as e:
