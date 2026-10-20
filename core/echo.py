@@ -90,6 +90,7 @@ _BLOCKS_NOISY = 12    # ~770 ms when the room is this hard
 _FLOOR_WINDOW = 60    # blocks kept to characterise the room's echo
 _FLOOR_Q = 35         # percentile taken as "typical echo here"
 _WARMUP = 16          # blocks (~1 s) of listening before judging anyone
+_WARMUP_VOICE = 0.50  # unmistakable non-echo residual allowed during warmup
 _RELEARN_RUN = 28     # a 'voice' lasting this long means the room changed
 
 
@@ -264,7 +265,10 @@ class EchoGuard:
             # thing it is watching for.
             warming = len(self._residuals) < _WARMUP
             thr = self.threshold
-            speech = (not warming) and best_res >= thr
+            # During warmup, still allow unmistakable non-echo so the first
+            # sentence of a session is interruptible. Ordinary echo stays below
+            # this bar; a second voice typically does not.
+            speech = best_res >= thr and (not warming or best_res >= _WARMUP_VOICE)
 
             if speech:
                 self._run += 1
@@ -278,12 +282,16 @@ class EchoGuard:
                 return True
 
             self._run = 0
-            self._residuals.append(best_res)
-            if len(self._residuals) > _FLOOR_WINDOW:
-                del self._residuals[:-_FLOOR_WINDOW]
-            if len(self._residuals) >= _WARMUP:
-                self._floor = float(np.percentile(self._residuals, _FLOOR_Q))
-                self._head = float(np.percentile(self._residuals, _HEAD_Q))
+            # Learn only from echo-like blocks. Training on the user's voice
+            # during warmup used to raise the threshold and make the next
+            # barge-in inconsistently deaf.
+            if best_res < thr:
+                self._residuals.append(best_res)
+                if len(self._residuals) > _FLOOR_WINDOW:
+                    del self._residuals[:-_FLOOR_WINDOW]
+                if len(self._residuals) >= _WARMUP:
+                    self._floor = float(np.percentile(self._residuals, _FLOOR_Q))
+                    self._head = float(np.percentile(self._residuals, _HEAD_Q))
             if warming:
                 return False
 

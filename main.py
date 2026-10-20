@@ -35,6 +35,7 @@ for _stream in ("stdout", "stderr"):
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import os
 import re
 import threading
 import time
@@ -43,6 +44,11 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+
+# Rate-limited barge-in diagnostics: JARVIS_BARGE_DEBUG=1
+_BARGE_DEBUG = (os.environ.get("JARVIS_BARGE_DEBUG") or "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 import sounddevice as sd
 import numpy as np
@@ -946,6 +952,7 @@ class JarvisLive:
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
+        self._last_user_speech = time.monotonic()
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -958,6 +965,22 @@ class JarvisLive:
             if drained:
                 print(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
         self.set_speaking(False)
+        # set_speaking(False) arms a full echo-tail window. After barge-in that
+        # window would drop the user's first words — keep only a short
+        # hardware-buffer drain.
+        self._tail_until = time.monotonic() + min(0.12, float(self._out_latency or 0.12))
+        # Spotify/video auto-mute and wake-word sleep both swallow the mic
+        # before Gemini. The user just talked over us — open the path.
+        try:
+            if self._wake_enabled and not self._awake:
+                self.wake(reason="barge-in")
+        except Exception:
+            pass
+        try:
+            if self.ui.muted:
+                self.ui.unmute_via_wake(note="Interrupted — microphone open.")
+        except Exception:
+            pass
         # The words we were about to mouth are never going to be spoken now.
         self._visemes.reset()
         self._play_cursor = 0.0     # next batch starts a fresh timeline
@@ -971,6 +994,8 @@ class JarvisLive:
                 )
             except Exception:
                 pass
+        if _BARGE_DEBUG:
+            print("[BARGE] interrupt — playback drained, mic open", flush=True)
         self.ui.write_log("SYS: Interrupted — listening...")
 
     def speak(self, text: str):
@@ -1344,9 +1369,69 @@ class JarvisLive:
 
         barge_in_blocks = 0
         barge_in_triggered = False
+        barge_misses = 0
+        barge_dbg_t = 0.0
 
         def callback(indata, frames, time_info, status):
-            nonlocal barge_in_blocks, barge_in_triggered
+            nonlocal barge_in_blocks, barge_in_triggered, barge_misses, barge_dbg_t
+
+            with self._speaking_lock:
+                jarvis_speaking = self._is_speaking
+
+            # ── Barge-in (before wake/mute gates) ─────────────────────────────
+            # Wake-word sleep and Spotify/video auto-mute must NOT require the
+            # user to say "Jarvis" just to interrupt active speech. Those gates
+            # apply to idle listening only; while JARVIS is talking we always
+            # run the echo-aware barge-in detector.
+            if jarvis_speaking:
+                if not barge_in_triggered:
+                    try:
+                        user_speech = self._echo.is_user_speech(
+                            indata, SEND_SAMPLE_RATE, _pcm_level(indata)
+                        )
+                    except Exception:
+                        user_speech = False
+
+                    if user_speech:
+                        barge_in_blocks += 1
+                        barge_misses = 0
+                    else:
+                        # One quiet/consonant block is normal; hard-reset only
+                        # after two consecutive non-speech blocks.
+                        barge_misses += 1
+                        if barge_misses >= 2:
+                            barge_in_blocks = 0
+
+                    need = self._echo.required_blocks
+                    if _BARGE_DEBUG:
+                        now = time.monotonic()
+                        if (now - barge_dbg_t) >= 0.25:
+                            barge_dbg_t = now
+                            try:
+                                muted = bool(self.ui.muted)
+                            except Exception:
+                                muted = False
+                            print(
+                                f"[BARGE] speech={user_speech} "
+                                f"blocks={barge_in_blocks}/{need} miss={barge_misses} "
+                                f"sim={self._echo.last_similarity:.2f} "
+                                f"lvl={_pcm_level(indata):.2f} "
+                                f"awake={self._awake} muted={muted}",
+                                flush=True,
+                            )
+
+                    if barge_in_blocks >= need:
+                        barge_in_triggered = True
+                        if _BARGE_DEBUG:
+                            print("[BARGE] trigger → interrupt()", flush=True)
+                        loop.call_soon_threadsafe(self.interrupt)
+                return
+
+            # Reset interruption detection between assistant responses.
+            barge_in_blocks = 0
+            barge_in_triggered = False
+            barge_misses = 0
+
             # ── Wake-word gate ───────────────────────────────────────────────
             # While asleep, the mic audio NEVER goes to Gemini (nothing is
             # streamed, so JARVIS can't respond to speech not addressed to it and
@@ -1369,43 +1454,6 @@ class JarvisLive:
                     return
             except Exception:
                 pass
-            with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
-
-            # ── Barge-in ─────────────────────────────────────────────────────
-            # While JARVIS talks the mic is not streamed, but it is still worth
-            # listening to locally: if the user starts speaking, cut the answer
-            # short the way a person would stop when interrupted.
-            #
-            # The whole difficulty is echo — on speakers the mic hears JARVIS.
-            # So the test is not "is the mic loud" but "is the mic louder than
-            # the echo of what we are playing right now", sustained long enough
-            # that a cough or a keystroke cannot trigger it.
-            if jarvis_speaking:
-                # Detect sustained user speech while JARVIS is talking.
-                # Require output history so uncalibrated audio isn't
-                # automatically treated as an interruption.
-                if not barge_in_triggered and self._echo._hist:
-                    try:
-                        user_speech = self._echo.is_user_speech(
-                            indata, SEND_SAMPLE_RATE, _pcm_level(indata)
-                        )
-                    except Exception:
-                        user_speech = False
-
-                    if user_speech:
-                        barge_in_blocks += 1
-                    else:
-                        barge_in_blocks = 0
-
-                    if barge_in_blocks >= self._echo.required_blocks:
-                        barge_in_triggered = True
-                        loop.call_soon_threadsafe(self.interrupt)
-                return
-
-            # Reset interruption detection between assistant responses.
-            barge_in_blocks = 0
-            barge_in_triggered = False
 
             # ── Echo tail ────────────────────────────────────────────────────
             # The speaking flag has dropped but the speakers have not finished.
@@ -1413,7 +1461,11 @@ class JarvisLive:
             # it was addressed, and answers its own last sentence. The microphone
             # stays OPEN — the guard only drops blocks that are our own voice, so
             # replying the instant it stops still works.
-            if self._tail_active():
+            # After barge-in, skip the tail filter so the interrupting utterance
+            # reaches Gemini instead of being classified as leftover echo.
+            if self._interrupted:
+                pass
+            elif self._tail_active():
                 try:
                     if not self._echo.is_user_speech(
                             indata, SEND_SAMPLE_RATE, _pcm_level(indata)):
