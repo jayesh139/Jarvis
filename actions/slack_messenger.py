@@ -45,9 +45,11 @@ _user_cache: dict[str, str] = {}     # lower display/real/name -> id
 _id_to_channel: dict[str, str] = {}  # channel id -> #name
 _id_to_user: dict[str, str] = {}     # user id -> display name
 _cache_ts = 0.0
-_CACHE_TTL = 300.0
+_CACHE_TTL = 300.0          # soft TTL for opportunistic refresh
+_DIR_TTL = 6 * 3600.0       # people/channel directory is good for 6 hours
 _dir_cache_loaded = False
 _last_users_error: str = ""
+_MIN_PEOPLE_CACHE = 5       # fewer than this ⇒ treat cache as incomplete
 
 # Live notify: shared queue drained by main.py
 _notify_queue: asyncio.Queue | None = None
@@ -554,14 +556,29 @@ def send_via_slack(receiver: str, message: str) -> str:
     return f"Sent on Slack to {label}."
 
 
+def _people_need_refresh() -> bool:
+    """True only when the people directory is missing/tiny or older than 6h."""
+    _load_dir_cache()
+    if len(_id_to_user) < _MIN_PEOPLE_CACHE:
+        return True
+    return (time.time() - _cache_ts) > _DIR_TTL
+
+
+def _channels_need_refresh() -> bool:
+    _load_dir_cache()
+    if not _channel_cache:
+        return True
+    return (time.time() - _cache_ts) > _DIR_TTL
+
+
 def _list_channels(token: str, limit: int = 25) -> str:
     _load_dir_cache()
-    if time.time() < _rate_limited_until and not _channel_cache:
-        return _friendly_api_error("ratelimited")
-    # Explicit list action always refreshes when allowed — a tiny/stale cache
-    # (e.g. one remembered name) must not block the full directory pull.
-    if time.time() >= _rate_limited_until:
-        _refresh_caches(token, force=True)
+    if _channels_need_refresh():
+        if time.time() < _rate_limited_until:
+            if not _channel_cache:
+                return _friendly_api_error("ratelimited")
+        else:
+            _refresh_caches(token, force=True)
     names = sorted({n.lstrip("#") for n in _channel_cache if not n.startswith("#")})
     if not names:
         if time.time() < _rate_limited_until:
@@ -577,14 +594,16 @@ def _list_channels(token: str, limit: int = 25) -> str:
 
 def _list_people(token: str, limit: int = 25) -> str:
     _load_dir_cache()
-    if time.time() < _rate_limited_until and len(_id_to_user) < 5:
-        return _friendly_api_error("ratelimited")
-    # Always try a full pull on this command — otherwise a 1-person cache
-    # from a previous DM look-up permanently hides the rest of the workspace.
-    if time.time() >= _rate_limited_until:
-        print("[Slack] refreshing people directory…", flush=True)
-        _refresh_caches(token, force=True)
-        print(f"[Slack] directory now has {len(_id_to_user)} people", flush=True)
+    # Do NOT re-download hundreds of users on every ask — that burns Slack
+    # rate limits and makes the model call list_people in a loop. Refresh only
+    # when the cache is empty/tiny or older than _DIR_TTL (6 hours).
+    if _people_need_refresh():
+        if time.time() < _rate_limited_until and len(_id_to_user) < _MIN_PEOPLE_CACHE:
+            return _friendly_api_error("ratelimited")
+        if time.time() >= _rate_limited_until:
+            print("[Slack] refreshing people directory (cache empty/stale)…", flush=True)
+            _refresh_caches(token, force=True)
+            print(f"[Slack] directory now has {len(_id_to_user)} people", flush=True)
 
     # Unique people by user id (display name), not every cache alias.
     names = sorted({name for name in _id_to_user.values() if name}, key=str.lower)
@@ -611,8 +630,9 @@ def _list_people(token: str, limit: int = 25) -> str:
     if extra > 0:
         body += f" (+{extra} more)"
     return (
-        f"Slack people I can message ({len(names)} total). "
-        f"Here are some: {body}."
+        f"Slack directory is ready ({len(names)} people cached). "
+        f"Do NOT call list_people again — just send with the person's name. "
+        f"Sample names: {body}."
     )
 
 
@@ -1092,6 +1112,9 @@ TOOL = {
         "'enable Slack notifications', 'pause Slack alerts'. "
         "Prefer this over send_message / desktop clicking whenever the platform "
         "is Slack. "
+        "IMPORTANT: Call list_people at most ONCE per conversation when you do "
+        "not know a name. After it returns, NEVER call list_people again — "
+        "use action=send with the person's name directly. "
         "Live alerts need slack_app_token + Socket Mode (see status). "
         "action=send needs target (#channel or @person) and text; "
         "action=read needs target; "
@@ -1104,8 +1127,8 @@ TOOL = {
             "action": {
                 "type": "STRING",
                 "description": (
-                    "'send' (default), 'read', 'list_channels', 'list_people', "
-                    "'status', 'notify_on', or 'notify_off'."
+                    "'send' (default), 'read', 'list_channels', 'list_people' "
+                    "(once only — then send), 'status', 'notify_on', or 'notify_off'."
                 ),
                 "enum": [
                     "send", "read", "list_channels", "list_people", "status",

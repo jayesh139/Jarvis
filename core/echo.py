@@ -98,8 +98,18 @@ def band_energies(pcm, sr: int) -> np.ndarray:
 
     Left unnormalised on purpose: the decision below projects one of these onto
     another, and a projection needs real magnitudes.
+
+    Accepts 1-D PCM (playback `frombuffer`) or sounddevice's `(frames, channels)`
+    mic blocks. A 2-D `(N, 1)` array must be flattened to mono first: otherwise
+    `x * hanning(N)` broadcasts to an `N×N` matrix, the FFT path throws, and
+    `is_user_speech` (which swallows exceptions) forever reports "not speech".
     """
     x = np.asarray(pcm, dtype=np.float32)
+    if x.ndim > 1:
+        # sounddevice InputStream: shape (frames, channels) — use first channel.
+        x = np.ascontiguousarray(x[:, 0] if x.shape[-1] >= 1 else x.reshape(-1))
+    else:
+        x = x.reshape(-1)
     if x.size < 64:
         return np.zeros(len(_BAND_EDGES) - 1, dtype=np.float32)
     x = x - x.mean()

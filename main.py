@@ -1342,7 +1342,11 @@ class JarvisLive:
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
+        barge_in_blocks = 0
+        barge_in_triggered = False
+
         def callback(indata, frames, time_info, status):
+            nonlocal barge_in_blocks, barge_in_triggered
             # ── Wake-word gate ───────────────────────────────────────────────
             # While asleep, the mic audio NEVER goes to Gemini (nothing is
             # streamed, so JARVIS can't respond to speech not addressed to it and
@@ -1378,15 +1382,30 @@ class JarvisLive:
             # the echo of what we are playing right now", sustained long enough
             # that a cough or a keystroke cannot trigger it.
             if jarvis_speaking:
-                # Nothing is streamed while JARVIS talks.
-                #
-                # Interrupting by voice used to live here: `EchoGuard` can pick a
-                # user out from under our own echo, and `core/echo.py` still does
-                # that for the tail below. Re-enabling is small — classify each
-                # block here and call interrupt() after `required_blocks` of
-                # agreement — but it depends on the listener's room, so it stays
-                # out until it can be tried on real hardware.
+                # Detect sustained user speech while JARVIS is talking.
+                # Require output history so uncalibrated audio isn't
+                # automatically treated as an interruption.
+                if not barge_in_triggered and self._echo._hist:
+                    try:
+                        user_speech = self._echo.is_user_speech(
+                            indata, SEND_SAMPLE_RATE, _pcm_level(indata)
+                        )
+                    except Exception:
+                        user_speech = False
+
+                    if user_speech:
+                        barge_in_blocks += 1
+                    else:
+                        barge_in_blocks = 0
+
+                    if barge_in_blocks >= self._echo.required_blocks:
+                        barge_in_triggered = True
+                        loop.call_soon_threadsafe(self.interrupt)
                 return
+
+            # Reset interruption detection between assistant responses.
+            barge_in_blocks = 0
+            barge_in_triggered = False
 
             # ── Echo tail ────────────────────────────────────────────────────
             # The speaking flag has dropped but the speakers have not finished.
@@ -1710,6 +1729,12 @@ class JarvisLive:
                         self._turn_done_event.clear()
                     continue
 
+                # interrupt() drained the queue and set this flag — do not play
+                # whatever chunk we already dequeued, or barge-in feels laggy.
+                if self._interrupted:
+                    self.set_speaking(False)
+                    continue
+
                 self.set_speaking(True)
 
                 # Batch all immediately-available chunks into one write to reduce
@@ -1717,10 +1742,15 @@ class JarvisLive:
                 # Cap at ~200 ms so interrupt() still stops audio within ~200 ms.
                 batch = bytearray(chunk)
                 while len(batch) < 9600:   # 9600 bytes ≈ 200 ms at 24 kHz / 16-bit mono
+                    if self._interrupted:
+                        break
                     try:
                         batch.extend(self.audio_in_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
+                if self._interrupted:
+                    self.set_speaking(False)
+                    continue
 
                 # Drive the HUD waveform and the avatar's mouth from JARVIS's
                 # own voice. The batch is up to 200 ms long, so we hand over a
@@ -1790,6 +1820,10 @@ class JarvisLive:
                 # the room does not talk to an empty chair (and so BLE buds on
                 # the phone are the only place the reply is heard).
                 if phone_listening:
+                    continue
+
+                if self._interrupted:
+                    self.set_speaking(False)
                     continue
 
                 try:
